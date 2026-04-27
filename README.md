@@ -218,10 +218,16 @@ OK ✅
 ## 🐳 Docker
 
 ```bash
-docker-compose up --build
-# After first boot:
-docker-compose exec backend python manage.py migrate --database=shard_0
-docker-compose exec backend python manage.py migrate --database=shard_1
-docker-compose exec backend python manage.py migrate --database=idempotency_db
-docker-compose exec backend python manage.py seed
+docker compose up -d --build
 ```
+
+**Note:** The backend Docker image uses an entrypoint script (`docker-entrypoint.sh`) that automatically waits for PostgreSQL, runs all database migrations across the shards, and seeds the initial data. No manual `exec` commands are necessary.
+
+---
+
+## 🌐 Deployment (Frontend)
+
+When deploying the frontend (e.g., to Vercel), ensure you set the correct environment variables pointing to your backend API:
+
+- `VITE_API_BASE_URL` or `VITE_API_URL`: Set this to your backend's public URL (e.g., `http://13.206.122.212:8000`).
+- Ensure the backend's `CORS_ALLOWED_ORIGINS` in `.env` includes your deployed frontend URL.

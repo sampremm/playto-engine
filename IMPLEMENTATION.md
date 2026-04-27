@@ -531,7 +531,9 @@ npm install && npm run dev
 # → http://localhost:5173
 ```
 
-### First-Time Database Setup
+### First-Time Database Setup (Local Manual Run)
+
+If running the services manually (outside of Docker):
 ```bash
 cd backend
 python manage.py migrate --database=default
@@ -540,3 +542,7 @@ python manage.py migrate --database=shard_1
 python manage.py migrate --database=idempotency_db
 python manage.py seed  # Creates 3 demo merchants with seeded balance
 ```
+
+**Note for Docker Users:**
+The `docker-compose up` command automatically triggers `docker-entrypoint.sh`, which performs all the above migrations and seeding for you. You do not need to run these manually if using Docker.
+
