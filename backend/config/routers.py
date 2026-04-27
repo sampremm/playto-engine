@@ -48,12 +48,20 @@ class ShardRouter:
         from django.conf import settings
         idem_alias = getattr(settings, 'IDEMPOTENCY_DB_ALIAS', 'idempotency_db')
 
+        # 1. IdempotencyKey only lives in the dedicated idempotency DB
         if model_name and model_name.lower() == 'idempotencykey':
-            # IdempotencyKey only migrates to whichever alias is configured
             return db == idem_alias
 
-        # All other models must NOT migrate to the idempotency database
-        if db == 'idempotency_db':
+        # 2. During app-level checks (model_name is None), we must allow
+        # the app that contains IdempotencyKey to 'see' the idempotency DB.
+        if model_name is None:
+            if app_label == 'payouts':
+                return db in [idem_alias, 'default', 'shard_0', 'shard_1']
+            if db == idem_alias:
+                return False  # No other apps should migrate here
+
+        # 3. All other models must NOT migrate to the idempotency database
+        if db == idem_alias:
             return False
 
         return True
