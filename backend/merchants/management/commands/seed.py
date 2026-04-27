@@ -36,6 +36,9 @@ class Command(BaseCommand):
                         )
                         self.stdout.write(self.style.SUCCESS(f'Created {email} with balance {balance/100} rupees'))
                     else:
-                        self.stdout.write(f'{email} already exists')
+                        # Always ensure demo password is correct
+                        merchant.password = make_password('demo123')
+                        merchant.save()
+                        self.stdout.write(f'{email} already exists (password reset)')
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f'Error seeding {email}: {str(e)}'))
