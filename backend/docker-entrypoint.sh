@@ -3,7 +3,7 @@ set -e
 
 # Wait for postgres to be ready (retry loop, not blind sleep)
 echo "Waiting for postgres..."
-until python -c "import django; django.setup(); from django.db import connections; connections['default'].ensure_connection()" 2>/dev/null; do
+until python -c "import django; django.setup(); from django.db import connections; connections['default'].ensure_connection()"; do
   echo "  postgres not ready, retrying in 2s..."
   sleep 2
 done

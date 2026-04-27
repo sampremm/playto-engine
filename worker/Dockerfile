@@ -18,6 +18,7 @@ ENV DJANGO_SETTINGS_MODULE=config.settings
 
 # Run as non-root user — least-privilege principle
 RUN addgroup --system celery && adduser --system --ingroup celery celery
+RUN chown -R celery:celery /app
 USER celery
 
 CMD ["celery", "-A", "worker.worker_app", "worker", "--loglevel=info", "-B"]
