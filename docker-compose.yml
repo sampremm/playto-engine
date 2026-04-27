@@ -125,7 +125,8 @@ services:
       redis:
         condition: service_started
     networks:
-      - internal           # Worker has NO public network access
+      - internal
+      - public           # REQUIRED to reach Neon Cloud DBs
     restart: unless-stopped
 
   # ── React Frontend — only :5173 exposed to host ──────────────────────────────
