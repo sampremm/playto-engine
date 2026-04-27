@@ -27,7 +27,7 @@ BACKOFF = [30, 120, 600]   # 30s, 2min, 10min
 
 
 @shared_task(name='webhooks.deliver', bind=True, max_retries=0)
-def deliver_webhook(self, delivery_id: str):
+def deliver_webhook(self, delivery_id: str, shard: str = 'default'):
     """
     Attempt to POST the webhook payload to the registered endpoint.
     Uses exponential back-off via Celery's ETA scheduling.
@@ -36,9 +36,9 @@ def deliver_webhook(self, delivery_id: str):
 
     # ── Idempotency guard ──────────────────────────────────────────────────
     try:
-        delivery = WebhookDelivery.objects.get(id=delivery_id)
+        delivery = WebhookDelivery.objects.using(shard).get(id=delivery_id)
     except WebhookDelivery.DoesNotExist:
-        logger.error(f"WebhookDelivery {delivery_id} not found — skipping")
+        logger.error(f"WebhookDelivery {delivery_id} not found in {shard} — skipping")
         return
 
     if delivery.status == WebhookDelivery.STATUS_SENT:
@@ -52,13 +52,13 @@ def deliver_webhook(self, delivery_id: str):
 
     # ── Transition to PROCESSING ───────────────────────────────────────────
     try:
-        delivery.transition_to(WebhookDelivery.STATUS_PROCESSING)
+        delivery.transition_to(WebhookDelivery.STATUS_PROCESSING, using=shard)
     except ValueError as e:
         logger.error(f"State transition error for {delivery_id}: {e}")
         return
 
     delivery.attempt_count += 1
-    delivery.save(update_fields=['status', 'attempt_count', 'updated_at'])
+    delivery.save(using=shard, update_fields=['attempt_count'])
 
     # ── Build the signed request ───────────────────────────────────────────
     endpoint = delivery.endpoint
@@ -83,10 +83,10 @@ def deliver_webhook(self, delivery_id: str):
         response.raise_for_status()
 
         # ✅ Success
-        delivery.transition_to(WebhookDelivery.STATUS_SENT)
+        delivery.transition_to(WebhookDelivery.STATUS_SENT, using=shard)
         delivery.last_http_status = response.status_code
         delivery.delivered_at = timezone.now()
-        delivery.save(update_fields=['status', 'last_http_status', 'delivered_at', 'updated_at'])
+        delivery.save(using=shard, update_fields=['last_http_status', 'delivered_at'])
         logger.info(f"Delivery {delivery_id} SENT (attempt {delivery.attempt_count})")
 
     except Exception as exc:
@@ -97,18 +97,18 @@ def deliver_webhook(self, delivery_id: str):
 
         if delivery.attempt_count >= delivery.max_attempts:
             # Max attempts exhausted — move to terminal FAILED
-            delivery.transition_to(WebhookDelivery.STATUS_FAILED)
-            delivery.save(update_fields=['status', 'last_http_status', 'last_error', 'updated_at'])
+            delivery.transition_to(WebhookDelivery.STATUS_FAILED, using=shard)
+            delivery.save(using=shard, update_fields=['last_http_status', 'last_error'])
             logger.warning(
                 f"Delivery {delivery_id} FAILED after {delivery.attempt_count} attempts: {exc}"
             )
         else:
             # Schedule a retry with exponential backoff
-            delivery.transition_to(WebhookDelivery.STATUS_RETRYING)
-            delivery.save(update_fields=['status', 'last_http_status', 'last_error', 'updated_at'])
+            delivery.transition_to(WebhookDelivery.STATUS_RETRYING, using=shard)
+            delivery.save(using=shard, update_fields=['last_http_status', 'last_error'])
 
             delay = BACKOFF[min(delivery.attempt_count - 1, len(BACKOFF) - 1)]
-            deliver_webhook.apply_async(args=[delivery_id], countdown=delay)
+            deliver_webhook.apply_async(args=[delivery_id], kwargs={'shard': shard}, countdown=delay)
             logger.info(
                 f"Delivery {delivery_id} RETRYING in {delay}s "
                 f"(attempt {delivery.attempt_count}/{delivery.max_attempts})"
@@ -122,7 +122,10 @@ def dispatch_payout_webhook(payout):
     """
     from .models import WebhookEndpoint, WebhookDelivery
 
-    endpoints = WebhookEndpoint.objects.filter(
+    # Use the shard where the payout (and merchant) already lives
+    active_shard = payout._state.db or 'default'
+
+    endpoints = WebhookEndpoint.objects.using(active_shard).filter(
         merchant=payout.merchant, is_active=True
     )
     if not endpoints.exists():
@@ -141,12 +144,12 @@ def dispatch_payout_webhook(payout):
     }
 
     for endpoint in endpoints:
-        delivery = WebhookDelivery.objects.create(
+        delivery = WebhookDelivery.objects.using(active_shard).create(
             endpoint=endpoint,
             event_type=event_type,
             payload=payload,
             status=WebhookDelivery.STATUS_QUEUED,
         )
         # Fire-and-forget — Celery picks it up asynchronously
-        deliver_webhook.delay(str(delivery.id))
-        logger.info(f"Queued {event_type} delivery {delivery.id} → {endpoint.url}")
+        deliver_webhook.apply_async(args=[str(delivery.id)], kwargs={'shard': active_shard})
+        logger.info(f"Queued {event_type} delivery {delivery.id} → {endpoint.url} (Shard: {active_shard})")

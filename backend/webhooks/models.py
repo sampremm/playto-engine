@@ -79,14 +79,21 @@ class WebhookDelivery(models.Model):
     class Meta:
         ordering = ['-created_at']
 
-    def transition_to(self, new_status: str):
-        """Enforce the state machine. Raises ValueError on illegal transition."""
+    def transition_to(self, new_status: str, using: str = None):
+        """
+        Enforce the state machine and persist the change.
+        Raises ValueError on illegal transition.
+        """
         allowed = self.LEGAL_TRANSITIONS.get(self.status, [])
         if new_status not in allowed:
             raise ValueError(
                 f"Illegal WebhookDelivery transition: {self.status} → {new_status}"
             )
         self.status = new_status
+        save_kwargs = {'update_fields': ['status', 'updated_at']}
+        if using:
+            save_kwargs['using'] = using
+        self.save(**save_kwargs)
 
     def __str__(self):
         return f"{self.event_type} [{self.status}] → {self.endpoint.url}"

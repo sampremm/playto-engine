@@ -66,11 +66,12 @@ class ShardRouter:
         if model_name is None:
             if app_label == 'payouts':
                 return db in [idem_alias, 'default', 'shard_0', 'shard_1']
-            if db == idem_alias:
+            if db == idem_alias and db != 'default':
                 return False  # No other apps should migrate here
 
         # 3. All other models must NOT migrate to the idempotency database
-        if db == idem_alias:
+        # unless it is the 'default' database (e.g. during tests).
+        if db == idem_alias and db != 'default':
             return False
 
         return True

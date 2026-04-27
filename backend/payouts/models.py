@@ -60,7 +60,7 @@ class Payout(models.Model):
         """Fallback guard for ORM-level saves (e.g. admin, shell)."""
         if self.pk:
             try:
-                old_status = Payout.objects.get(pk=self.pk).status
+                old_status = Payout.objects.using(self._state.db).get(pk=self.pk).status
                 allowed = self.LEGAL_TRANSITIONS.get(old_status, [])
                 if old_status != self.status and self.status not in allowed:
                     raise ValueError(f"Illegal state transition from {old_status} to {self.status}")
