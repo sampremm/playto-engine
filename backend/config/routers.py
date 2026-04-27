@@ -23,19 +23,28 @@ class ShardRouter:
             return 'default'
 
     def db_for_read(self, model, **hints):
-        # Idempotency keys always go to their dedicated database
+        # 1. Idempotency keys always go to their dedicated database
         if model.__name__.lower() in self.IDEMPOTENCY_MODELS:
             return 'idempotency_db'
 
-        if 'instance' in hints:
-            if model.__name__ == 'Merchant':
-                return self.get_shard(hints['instance'].id)
-            if hasattr(hints['instance'], 'merchant_id'):
-                return self.get_shard(hints['instance'].merchant_id)
+        # 2. Shard routing for business models
+        if model._meta.app_label in ['merchants', 'payouts', 'webhooks']:
+            merchant_id = None
+            if 'instance' in hints:
+                inst = hints['instance']
+                if model.__name__ == 'Merchant':
+                    merchant_id = inst.id
+                elif hasattr(inst, 'merchant_id'):
+                    merchant_id = inst.merchant_id
+                elif hasattr(inst, 'merchant') and hasattr(inst.merchant, 'id'):
+                    merchant_id = inst.merchant.id
+            
+            if merchant_id is None and 'merchant_id' in hints:
+                merchant_id = hints['merchant_id']
 
-        if 'merchant_id' in hints:
-            return self.get_shard(hints['merchant_id'])
-
+            if merchant_id:
+                return self.get_shard(merchant_id)
+        
         return None
 
     def db_for_write(self, model, **hints):
