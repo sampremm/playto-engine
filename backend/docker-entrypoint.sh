@@ -6,6 +6,7 @@ export DJANGO_SETTINGS_MODULE=config.settings
 echo "Waiting for postgres..."
 until python -c "import django; django.setup(); from django.db import connections; connections['default'].ensure_connection()"; do
   echo "  postgres not ready, retrying in 2s..."
+  python -c "import django; django.setup(); from django.db import connections; connections['default'].ensure_connection()" 2>&1 | head -n 1
   sleep 2
 done
 echo "Postgres is ready."
