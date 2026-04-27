@@ -1,0 +1,148 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+  workflow_dispatch:
+
+jobs:
+  test-backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: test_payto_default
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r backend/requirements.txt
+
+    - name: Run tests
+      env:
+        SECRET_KEY: test-key
+        DATABASE_URL: postgres://postgres:password@localhost:5432/test_payto_default
+        SHARD_0_URL: postgres://postgres:password@localhost:5432/test_payto_default
+        SHARD_1_URL: postgres://postgres:password@localhost:5432/test_payto_default
+        IDEMPOTENCY_DB_URL: postgres://postgres:password@localhost:5432/test_payto_default
+        REDIS_URL: redis://localhost:6379/0
+        IDEMPOTENCY_REDIS_URL: redis://localhost:6379/1
+      run: |
+        cd backend
+        python manage.py test payouts.tests --verbosity=2
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm install
+
+    - name: Build
+      run: |
+        cd frontend
+        npm run build
+
+  docker-build:
+    needs: [test-backend, build-frontend]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and Push Backend Image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/playto-backend:latest
+          ${{ secrets.DOCKERHUB_USERNAME }}/playto-backend:${{ github.sha }}
+
+    - name: Build and Push Worker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./worker/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/playto-worker:latest
+          ${{ secrets.DOCKERHUB_USERNAME }}/playto-worker:${{ github.sha }}
+
+    - name: Build and Push Frontend Image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/playto-frontend:latest
+          ${{ secrets.DOCKERHUB_USERNAME }}/playto-frontend:${{ github.sha }}
+
+  deploy-ec2:
+    needs: docker-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Deploy to EC2 via SSH
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          cd ~/playto-pay
+          # Login to Docker Hub on EC2 to pull private images
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          # Pull latest images
+          docker compose down --remove-orphans
+          docker compose pull
+          # Restart the stack
+          docker compose up -d
+          # Prune old images to save space
+          docker image prune -f
