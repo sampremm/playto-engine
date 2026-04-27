@@ -1,0 +1,161 @@
+services:
+
+  # ── Internal databases — NO host port exposure ──────────────────────────────
+  # Only reachable by other containers on the `internal` network.
+  shard_0:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       playto_shard_0
+    volumes:
+      - shard_0_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d playto_shard_0"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  shard_1:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       playto_shard_1
+    volumes:
+      - shard_1_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d playto_shard_1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Dedicated idempotency key database ──────────────────────────────
+  # Isolated PostgreSQL for idempotency keys only.
+  # Can be cleared, audited, or scaled independently of business shards.
+  idempotency_db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       playto_idempotency
+    volumes:
+      - idempotency_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d playto_idempotency"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis — internal only, password-protected ────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD} --bind 0.0.0.0 --protected-mode no
+    networks:
+      - internal
+    restart: unless-stopped
+
+  # ── Django API — only :8000 exposed to host ──────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"            # Only public-facing service on the backend side
+    environment:
+      SECRET_KEY:             ${SECRET_KEY}
+      DEBUG:                  "False"
+      ALLOWED_HOSTS:          "localhost,127.0.0.1,backend"
+      CORS_ALLOWED_ORIGINS:   "http://localhost:5173"
+      DATABASE_URL:           postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
+      SHARD_0_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
+      SHARD_1_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_1:5432/playto_shard_1
+      IDEMPOTENCY_DB_URL:     postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@idempotency_db:5432/playto_idempotency
+      REDIS_URL:              redis://:${REDIS_PASSWORD}@redis:6379/0
+      IDEMPOTENCY_REDIS_URL:  redis://:${REDIS_PASSWORD}@redis:6379/1
+    depends_on:
+      shard_0:
+        condition: service_healthy
+      shard_1:
+        condition: service_healthy
+      idempotency_db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - internal
+      - public
+    restart: unless-stopped
+
+  # ── Celery Worker — internal only, no exposed ports ──────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    volumes:
+      - ./backend:/app/backend
+      - ./worker:/app/worker
+    environment:
+      SECRET_KEY:             ${SECRET_KEY}
+      DEBUG:                  "False"
+      DATABASE_URL:           postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
+      SHARD_0_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
+      SHARD_1_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_1:5432/playto_shard_1
+      IDEMPOTENCY_DB_URL:     postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@idempotency_db:5432/playto_idempotency
+      REDIS_URL:              redis://:${REDIS_PASSWORD}@redis:6379/0
+      IDEMPOTENCY_REDIS_URL:  redis://:${REDIS_PASSWORD}@redis:6379/1
+    depends_on:
+      shard_0:
+        condition: service_healthy
+      shard_1:
+        condition: service_healthy
+      idempotency_db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - internal           # Worker has NO public network access
+    restart: unless-stopped
+
+  # ── React Frontend — only :5173 exposed to host ──────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - public
+    restart: unless-stopped
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  internal:
+    driver: bridge
+    internal: true          # Containers on this network CANNOT reach the internet
+  public:
+    driver: bridge
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  shard_0_data:
+  shard_1_data:
+  idempotency_data:
