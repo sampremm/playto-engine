@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./backend/
 COPY worker/ ./worker/
 
-ENV PYTHONPATH=/app/backend
+ENV PYTHONPATH=/app:/app/backend
 ENV DJANGO_SETTINGS_MODULE=config.settings
 
 # Run as non-root user — least-privilege principle

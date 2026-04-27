@@ -12,7 +12,7 @@ from payouts.models import Payout
 from merchants.models import LedgerEntry
 from webhooks.tasks import dispatch_payout_webhook
 
-app = Celery('worker', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'))
+app = Celery('worker_app', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'))
 
 
 @app.task(name='worker_app.process_payout', bind=True, max_retries=3)
