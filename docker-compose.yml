@@ -78,12 +78,12 @@ services:
       DEBUG:                  "False"
       ALLOWED_HOSTS:          "localhost,127.0.0.1,backend"
       CORS_ALLOWED_ORIGINS:   "http://localhost:5173"
-      DATABASE_URL:           postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
-      SHARD_0_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
-      SHARD_1_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_1:5432/playto_shard_1
-      IDEMPOTENCY_DB_URL:     postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@idempotency_db:5432/playto_idempotency
-      REDIS_URL:              redis://:${REDIS_PASSWORD}@redis:6379/0
-      IDEMPOTENCY_REDIS_URL:  redis://:${REDIS_PASSWORD}@redis:6379/1
+      DATABASE_URL:           ${DATABASE_URL}
+      SHARD_0_URL:            ${SHARD_0_URL}
+      SHARD_1_URL:            ${SHARD_1_URL}
+      IDEMPOTENCY_DB_URL:     ${IDEMPOTENCY_DB_URL}
+      REDIS_URL:              ${REDIS_URL}
+      IDEMPOTENCY_REDIS_URL:  ${IDEMPOTENCY_REDIS_URL}
     depends_on:
       shard_0:
         condition: service_healthy
@@ -109,12 +109,12 @@ services:
     environment:
       SECRET_KEY:             ${SECRET_KEY}
       DEBUG:                  "False"
-      DATABASE_URL:           postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
-      SHARD_0_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_0:5432/playto_shard_0
-      SHARD_1_URL:            postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@shard_1:5432/playto_shard_1
-      IDEMPOTENCY_DB_URL:     postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@idempotency_db:5432/playto_idempotency
-      REDIS_URL:              redis://:${REDIS_PASSWORD}@redis:6379/0
-      IDEMPOTENCY_REDIS_URL:  redis://:${REDIS_PASSWORD}@redis:6379/1
+      DATABASE_URL:           ${DATABASE_URL}
+      SHARD_0_URL:            ${SHARD_0_URL}
+      SHARD_1_URL:            ${SHARD_1_URL}
+      IDEMPOTENCY_DB_URL:     ${IDEMPOTENCY_DB_URL}
+      REDIS_URL:              ${REDIS_URL}
+      IDEMPOTENCY_REDIS_URL:  ${IDEMPOTENCY_REDIS_URL}
     depends_on:
       shard_0:
         condition: service_healthy
