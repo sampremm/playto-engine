@@ -1,5 +1,6 @@
 #!/bin/sh
 set -e
+export DJANGO_SETTINGS_MODULE=config.settings
 
 # Wait for postgres to be ready (retry loop, not blind sleep)
 echo "Waiting for postgres..."
