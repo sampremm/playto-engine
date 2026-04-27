@@ -172,6 +172,59 @@ TIME_ZONE     = 'UTC'
 USE_I18N      = True
 USE_TZ        = True
 
+# ─── Logging ──────────────────────────────────────────────────────────────────
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '[{levelname}] {module}: {message}',
+            'style': '{',
+        },
+        'rich': {
+            'format': '➔ {levelname} | {module} | {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+        'rich_console': {
+            'level': 'DEBUG' if config('DEBUG', default=False, cast=bool) else 'INFO',
+            'class': 'logging.StreamHandler',
+            'formatter': 'rich',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'payouts': {
+            'handlers': ['rich_console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'webhooks': {
+            'handlers': ['rich_console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+    },
+}
+
 STATIC_URL          = 'static/'
 DEFAULT_AUTO_FIELD  = 'django.db.models.BigAutoField'
 

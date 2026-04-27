@@ -14,6 +14,9 @@ from webhooks.tasks import dispatch_payout_webhook
 
 app = Celery('worker_app', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'))
 
+import logging
+logger = logging.getLogger('payouts')
+
 
 @app.task(name='worker_app.process_payout', bind=True, max_retries=3)
 def process_payout(self, payout_id):
@@ -40,20 +43,20 @@ def process_payout(self, payout_id):
     short_id = str(payout_id)[:8]
     
     if payout.status == 'PENDING':
-        print(f"📥 [WORKER] Starting new payout {short_id}... (Shard: {active_shard})")
+        logger.info(f"📥 [WORKER] Starting new payout {short_id}... (Shard: {active_shard})")
         payout.transition_to('PROCESSING', using=active_shard)
     else:
-        print(f"🔄 [WORKER] Retrying payout {short_id} (Attempt {payout.attempt_count})...")
+        logger.info(f"🔄 [WORKER] Retrying payout {short_id} (Attempt {payout.attempt_count})...")
         payout.save(using=active_shard, update_fields=['attempt_count', 'updated_at'])
 
     outcome = random.random()
 
     if outcome < 0.1:
-        print(f"⏳ [WORKER] Payout {short_id} HUNG. Will retry later.")
+        logger.info(f"⏳ [WORKER] Payout {short_id} HUNG. Will retry later.")
         return
 
     elif outcome < 0.8:
-        print(f"✅ [WORKER] Payout {short_id} SUCCESS!")
+        logger.info(f"✅ [WORKER] Payout {short_id} SUCCESS!")
         with transaction.atomic(using=active_shard):
             payout.transition_to('COMPLETED', using=active_shard)
             LedgerEntry.objects.using(active_shard).create(
@@ -65,7 +68,7 @@ def process_payout(self, payout_id):
         dispatch_payout_webhook(payout)
 
     else:
-        print(f"❌ [WORKER] Payout {short_id} FAILED. Reversing funds.")
+        logger.info(f"❌ [WORKER] Payout {short_id} FAILED. Reversing funds.")
         with transaction.atomic(using=active_shard):
             payout.transition_to('FAILED', using=active_shard)
             LedgerEntry.objects.using(active_shard).create(
