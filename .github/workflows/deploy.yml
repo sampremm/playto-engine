@@ -139,10 +139,11 @@ jobs:
           cd ~/playto-pay
           # Login to Docker Hub on EC2 to pull private images
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-          # Pull latest images
-          docker compose down --remove-orphans
-          docker compose pull
-          # Restart the stack
-          docker compose up -d
+          
+          # Use the hyphen for Ubuntu's older Docker Compose syntax!
+          docker-compose down --remove-orphans
+          docker-compose pull
+          docker-compose up -d
+          
           # Prune old images to save space
           docker image prune -f
