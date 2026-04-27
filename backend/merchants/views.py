@@ -8,11 +8,14 @@ class BalanceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        ledger_entries = LedgerEntry.objects.filter(merchant=request.user)
+        from config.routers import ShardRouter
+        active_shard = ShardRouter().get_shard(request.user.id)
+        
+        ledger_entries = LedgerEntry.objects.using(active_shard).filter(merchant=request.user)
         available_paise = ledger_entries.aggregate(Sum('amount_paise'))['amount_paise__sum'] or 0
         
         # Calculate held amount from active payouts
-        active_payouts = request.user.payouts.filter(status__in=['PENDING', 'PROCESSING'])
+        active_payouts = request.user.payouts.using(active_shard).filter(status__in=['PENDING', 'PROCESSING'])
         held_paise = active_payouts.aggregate(Sum('amount_paise'))['amount_paise__sum'] or 0
         
         total_credited = ledger_entries.filter(entry_type='CREDIT').aggregate(Sum('amount_paise'))['amount_paise__sum'] or 0
@@ -29,7 +32,10 @@ class LedgerView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        entries = LedgerEntry.objects.filter(merchant=request.user).order_by('-created_at')
+        from config.routers import ShardRouter
+        active_shard = ShardRouter().get_shard(request.user.id)
+        
+        entries = LedgerEntry.objects.using(active_shard).filter(merchant=request.user).order_by('-created_at')
         return Response([{
             'id': entry.id,
             'amount_paise': entry.amount_paise,

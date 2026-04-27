@@ -10,7 +10,10 @@ class WebhookEndpointView(APIView):
 
     def get(self, request):
         """List all registered webhook endpoints for the authenticated merchant."""
-        endpoints = WebhookEndpoint.objects.filter(merchant=request.user)
+        from config.routers import ShardRouter
+        active_shard = ShardRouter().get_shard(request.user.id)
+        
+        endpoints = WebhookEndpoint.objects.using(active_shard).filter(merchant=request.user)
         return Response([{
             'id': str(e.id),
             'url': e.url,
@@ -20,13 +23,16 @@ class WebhookEndpointView(APIView):
 
     def post(self, request):
         """Register a new webhook endpoint URL."""
+        from config.routers import ShardRouter
+        active_shard = ShardRouter().get_shard(request.user.id)
+        
         url = request.data.get('url')
         secret = request.data.get('secret', '')
 
         if not url:
             return Response({'error': 'url is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        endpoint = WebhookEndpoint.objects.create(
+        endpoint = WebhookEndpoint.objects.using(active_shard).create(
             merchant=request.user,
             url=url,
             secret=secret,
@@ -40,10 +46,13 @@ class WebhookEndpointView(APIView):
 
     def delete(self, request):
         """Permanently delete a webhook endpoint."""
+        from config.routers import ShardRouter
+        active_shard = ShardRouter().get_shard(request.user.id)
+        
         endpoint_id = request.data.get('id')
         try:
-            endpoint = WebhookEndpoint.objects.get(id=endpoint_id, merchant=request.user)
-            endpoint.delete()
+            endpoint = WebhookEndpoint.objects.using(active_shard).get(id=endpoint_id, merchant=request.user)
+            endpoint.delete(using=active_shard)
             return Response({'message': 'Endpoint deleted'})
         except WebhookEndpoint.DoesNotExist:
             return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -57,7 +66,10 @@ class WebhookDeliveryView(APIView):
         List recent webhook delivery attempts for the merchant.
         Shows the full lifecycle: QUEUED → PROCESSING → RETRYING → SENT/FAILED
         """
-        deliveries = WebhookDelivery.objects.filter(
+        from config.routers import ShardRouter
+        active_shard = ShardRouter().get_shard(request.user.id)
+        
+        deliveries = WebhookDelivery.objects.using(active_shard).filter(
             endpoint__merchant=request.user
         ).select_related('endpoint').order_by('-created_at')[:50]
 
