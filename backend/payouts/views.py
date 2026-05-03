@@ -182,16 +182,15 @@ class PayoutCreateView(APIView):
                 response_status_code = status.HTTP_201_CREATED
                 self._commit(rkey, pg_record, response_data, response_status_code)
 
-                def _enqueue_safe(payout_id):
-                    """Best-effort task enqueue. If the broker is temporarily
-                    unreachable, the beat task retry_stuck_payouts will pick
-                    up the PENDING payout within 30 seconds."""
-                    try:
-                        process_payout.delay(payout_id)
-                    except Exception:
-                        pass  # Non-fatal — beat will retry
+                # Fire Celery task immediately — transaction.on_commit()
+                # silently drops the callback on sharded databases because
+                # Django's on_commit hook is bound to the 'default' alias,
+                # not the active_shard alias used in our transaction.atomic().
+                try:
+                    process_payout.delay(str(payout.id))
+                except Exception:
+                    pass  # Non-fatal — Beat will pick it up within 30s
 
-                transaction.on_commit(lambda: _enqueue_safe(str(payout.id)))
                 return Response(response_data, status=response_status_code)
 
         except Exception as e:
