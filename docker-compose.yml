@@ -132,6 +132,32 @@ services:
       - public           # REQUIRED to reach Neon Cloud DBs
     restart: unless-stopped
 
+  # ── Celery Beat — scheduler, internal only ───────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    command: celery -A worker.worker_app beat -l info
+    volumes:
+      - ./backend:/app/backend
+      - ./worker:/app/worker
+    environment:
+      SECRET_KEY:             ${SECRET_KEY}
+      DEBUG:                  "False"
+      DATABASE_URL:           ${DATABASE_URL}
+      SHARD_0_URL:            ${SHARD_0_URL}
+      SHARD_1_URL:            ${SHARD_1_URL}
+      IDEMPOTENCY_DB_URL:     ${IDEMPOTENCY_DB_URL}
+      REDIS_URL:              ${REDIS_URL}
+      IDEMPOTENCY_REDIS_URL:  ${IDEMPOTENCY_REDIS_URL}
+    depends_on:
+      - redis
+      - backend
+    networks:
+      - internal
+      - public
+    restart: unless-stopped
+
 # ── Networks ──────────────────────────────────────────────────────────────────
 networks:
   internal:

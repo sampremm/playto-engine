@@ -182,12 +182,16 @@ class PayoutCreateView(APIView):
                 response_status_code = status.HTTP_201_CREATED
                 self._commit(rkey, pg_record, response_data, response_status_code)
 
-                # Fire Celery task immediately — transaction.on_commit()
-                # silently drops the callback on sharded databases because
-                # Django's on_commit hook is bound to the 'default' alias,
-                # not the active_shard alias used in our transaction.atomic().
+                # Fire Celery task with a 2-second countdown.
+                # Why? The worker is faster than the DB commit. Without this
+                # delay, the worker queries the shard before PostgreSQL has
+                # finished writing the PENDING row, finds nothing, and exits.
+                # Beat would eventually pick it up, but only after 30 seconds.
+                # The 2s countdown gives the DB plenty of time to flush.
                 try:
-                    process_payout.delay(str(payout.id))
+                    process_payout.apply_async(
+                        args=[str(payout.id)], countdown=2
+                    )
                 except Exception:
                     pass  # Non-fatal — Beat will pick it up within 30s
 

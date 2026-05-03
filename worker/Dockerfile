@@ -21,4 +21,4 @@ RUN addgroup --system celery && adduser --system --ingroup celery celery
 RUN chown -R celery:celery /app
 USER celery
 
-CMD ["celery", "-A", "worker.worker_app", "worker", "--loglevel=info", "-B"]
+CMD ["celery", "-A", "worker.worker_app", "worker", "--loglevel=info"]
