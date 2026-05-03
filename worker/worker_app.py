@@ -24,15 +24,19 @@ def process_payout(self, payout_id):
     active_shard = 'default'
     
     # Iterate shards to find this specific payout
+    logger.info(f"🔍 [WORKER] Searching for payout {payout_id} across all shards...")
+    
     for shard in ['default', 'shard_0', 'shard_1']:
         try:
             payout = Payout.objects.using(shard).get(id=payout_id)
             active_shard = shard
+            logger.info(f"🎯 [WORKER] Found payout {payout_id} in shard: {shard}")
             break
         except Payout.DoesNotExist:
             continue
 
     if not payout:
+        logger.error(f"❌ [WORKER] Payout {payout_id} NOT FOUND in any shard! Check DB connections.")
         return
 
     # Skip if already in a terminal state
