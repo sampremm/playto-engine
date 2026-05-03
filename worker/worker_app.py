@@ -56,7 +56,8 @@ def process_payout(self, payout_id):
     outcome = random.random()
 
     if outcome < 0.1:
-        logger.info(f"⏳ [WORKER] Payout {short_id} HUNG. Will retry later.")
+        logger.info(f"⏳ [WORKER] Payout {short_id} HUNG. Scheduling retry in 30s.")
+        process_payout.apply_async((payout_id,), countdown=30)
         return
 
     elif outcome < 0.8:
