@@ -2,6 +2,8 @@
 
 A production-grade, distributed payout infrastructure with idempotency, concurrency safety, async processing, and a real-time webhook delivery engine — all backed by a premium React dashboard.
 
+> **Live Demo:** Frontend → [playto-engine-vert.vercel.app](https://playto-engine-vert.vercel.app) · API → [playtopay.duckdns.org](https://playtopay.duckdns.org)
+
 ---
 
 ## 🏗️ Architecture & Stack
@@ -108,13 +110,26 @@ Illegal transitions (e.g. `FAILED → COMPLETED`) are blocked by `transition_to(
 
 ## 🚀 How to Run
 
-### Prerequisites
+### Option A: Docker (Recommended)
+
+```bash
+# Clone and start everything
+git clone https://github.com/sampremm/playto-engine.git
+cd playto-engine
+docker compose up -d --build
+```
+
+The backend entrypoint script automatically handles migrations, seeding, and database readiness checks. No manual setup needed.
+
+### Option B: Local Development
+
+#### Prerequisites
 ```bash
 brew services start postgresql@15
 brew services start redis
 ```
 
-### Environment — `backend/.env`
+#### Environment — `.env` (project root)
 ```env
 SECRET_KEY=your-secret-key
 DATABASE_URL=postgres://<user>@localhost:5432/postgres
@@ -123,19 +138,24 @@ SHARD_1_URL=postgres://<user>@localhost:5432/postgres
 IDEMPOTENCY_DB_URL=postgres://<user>@localhost:5432/postgres
 REDIS_URL=redis://localhost:6379/0
 IDEMPOTENCY_REDIS_URL=redis://localhost:6379/1
+ALLOWED_HOSTS=localhost,127.0.0.1
+CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 ```
 
-### Terminal 1 — Django API
+#### Terminal 1 — Django API
 ```bash
 cd backend
 source ../.venv/bin/activate
 python manage.py migrate --database=default
+python manage.py migrate --database=shard_0
+python manage.py migrate --database=shard_1
+python manage.py migrate --database=idempotency_db
 python manage.py seed
 python manage.py runserver
 # → http://localhost:8000
 ```
 
-### Terminal 2 — Celery Worker + Beat
+#### Terminal 2 — Celery Worker + Beat
 ```bash
 cd /path/to/Payto-pay
 source .venv/bin/activate
@@ -144,7 +164,7 @@ export DJANGO_SETTINGS_MODULE=config.settings
 celery -A worker.worker_app worker -l info -B
 ```
 
-### Terminal 3 — React Frontend
+#### Terminal 3 — React Frontend
 ```bash
 cd frontend
 npm install
@@ -215,19 +235,51 @@ OK ✅
 
 ---
 
-## 🐳 Docker
+## 🐳 Docker Compose Services
 
 ```bash
 docker compose up -d --build
 ```
 
-**Note:** The backend Docker image uses an entrypoint script (`docker-entrypoint.sh`) that automatically waits for PostgreSQL, runs all database migrations across the shards, and seeds the initial data. No manual `exec` commands are necessary.
+| Service | Image | Purpose | Exposed Port |
+|---|---|---|---|
+| `shard_0` | `postgres:15-alpine` | Business data shard (even merchant IDs) | Internal only |
+| `shard_1` | `postgres:15-alpine` | Business data shard (odd merchant IDs) | Internal only |
+| `idempotency_db` | `postgres:15-alpine` | ACID idempotency key store | Internal only |
+| `redis` | `redis:7-alpine` | Celery broker (db=0) + idem cache (db=1) | Internal only |
+| `backend` | Custom (Python 3.11) | Django API server | `:8000` |
+| `worker` | Custom (Python 3.11) | Celery worker + Beat scheduler | None |
+
+The backend entrypoint (`docker-entrypoint.sh`) automatically waits for PostgreSQL readiness, runs all migrations across shards, and seeds demo data.
 
 ---
 
-## 🌐 Deployment (Frontend)
+## 🌐 Production Deployment
 
-When deploying the frontend (e.g., to Vercel), ensure you set the correct environment variables pointing to your backend API:
+### Architecture
 
-- `VITE_API_BASE_URL` or `VITE_API_URL`: Set this to your backend's public URL (e.g., `http://13.206.122.212:8000`).
-- Ensure the backend's `CORS_ALLOWED_ORIGINS` in `.env` includes your deployed frontend URL.
+```
+┌─────────────────────────┐        ┌──────────────────────────────────────┐
+│  Vercel (Frontend)      │        │  AWS EC2 (Backend)                   │
+│  playto-engine-vert     │  HTTPS │  playtopay.duckdns.org               │
+│  .vercel.app            │───────→│  Nginx (TLS termination)             │
+│                         │        │    ↓ proxy_pass :8000                │
+│  vercel.json rewrites   │        │  Docker Compose                     │
+│  SPA routing fallback   │        │    backend + worker + DBs + Redis   │
+└─────────────────────────┘        └──────────────────────────────────────┘
+```
+
+### Frontend (Vercel)
+
+- **Environment Variable:** `VITE_API_BASE_URL=https://playtopay.duckdns.org`
+- **SPA Routing:** `frontend/vercel.json` rewrites all paths to `index.html`
+- Redeploy after changing env vars (Vite bakes them at build time)
+
+### Backend (EC2 + Docker)
+
+- **Domain:** `playtopay.duckdns.org` (DuckDNS dynamic DNS)
+- **TLS:** Nginx handles SSL termination, proxies to Django on `:8000`
+- **Django Config:**
+  - `SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')` in `settings.py`
+  - `ALLOWED_HOSTS` and `CORS_ALLOWED_ORIGINS` in `.env` include both the DuckDNS domain and Vercel origin
+- **Deploy:** `git pull && docker compose up -d --build`

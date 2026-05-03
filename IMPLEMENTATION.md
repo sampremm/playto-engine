@@ -39,8 +39,10 @@ The system is intentionally over-engineered relative to a simple CRUD app. Every
 │  ┌─────────────────────────────────────────────────────────────┐    │
 │  │  Celery Beat (scheduler, every 30s)                         │    │
 │  │  • Picks up PENDING payouts orphaned by broker failures     │    │
-│  │  • Retries PROCESSING payouts with exponential backoff      │    │
-│  │  • Marks FAILED + writes DEBIT_RELEASE after 3 attempts     │    │
+│  │  • Retries — PROCESSING but no terminal transition:         │    │
+│  │    Worker schedules automatic retry via apply_async(countdown=30) │
+│  │    Beat task also monitors with exponential backoff         │    │
+│  │    After 3 attempts → forced to FAILED + DEBIT_RELEASE      │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 └────────────────────────────┬────────────────────────────────────────┘
                              │ HTTP POST + HMAC signature
@@ -545,4 +547,54 @@ python manage.py seed  # Creates 3 demo merchants with seeded balance
 
 **Note for Docker Users:**
 The `docker-compose up` command automatically triggers `docker-entrypoint.sh`, which performs all the above migrations and seeding for you. You do not need to run these manually if using Docker.
+
+---
+
+## Production Deployment
+
+### Infrastructure
+
+| Component | Platform | URL |
+|---|---|---|
+| Frontend | Vercel | `https://playto-engine-vert.vercel.app` |
+| Backend API | AWS EC2 + Docker | `https://playtopay.duckdns.org` |
+| TLS Termination | Nginx on EC2 | Reverse proxy to Django `:8000` |
+| Domain | DuckDNS | Dynamic DNS pointing to EC2 public IP |
+
+### Key Configuration
+
+**Django (`settings.py`):**
+```python
+# Trust the X-Forwarded-Proto header from Nginx
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+```
+
+**Environment (`.env` on EC2):**
+```env
+ALLOWED_HOSTS=localhost,127.0.0.1,backend,13.206.122.212,playtopay.duckdns.org
+CORS_ALLOWED_ORIGINS=https://playto-engine-vert.vercel.app,https://playtopay.duckdns.org,http://localhost:5173
+```
+
+**Frontend SPA Routing (`frontend/vercel.json`):**
+```json
+{
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
+```
+This tells Vercel to serve `index.html` for all routes, allowing React Router to handle client-side navigation (fixes 404 on page refresh).
+
+### Deploy Workflow
+
+```bash
+# On local machine
+git add . && git commit -m "fix: description" && git push origin main
+
+# On EC2
+git pull origin main
+docker compose up -d --build
+```
+
+Vercel auto-deploys on push to `main`. Backend requires manual pull + rebuild on EC2.
 

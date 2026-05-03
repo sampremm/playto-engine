@@ -420,7 +420,8 @@ Celery Worker (within 30s):
       COMMIT
       dispatch_payout_webhook(payout)
   5c. HANG (10%):
-      Beat task retries with exponential backoff
+      Worker schedules automatic retry: apply_async(countdown=30)
+      Beat task also monitors with exponential backoff
       After 3 attempts → FAILED + DEBIT_RELEASE
 
 Webhook Engine:
@@ -432,8 +433,49 @@ Webhook Engine:
   6. After 3 failures → FAILED (terminal)
 
 Client Dashboard (polling):
+  • Hosted on Vercel (playto-engine-vert.vercel.app)
+  • API calls to playtopay.duckdns.org (EC2 + Nginx + Docker)
+  • vercel.json rewrites handle SPA routing (no 404 on refresh)
   • Every 60s: fetch balance + payout list
   • When on Webhooks tab: fetch every 10s
   • Payout status updates: PENDING → COMPLETED/FAILED
   • Delivery history: QUEUED → PROCESSING → SENT/FAILED
 ```
+
+---
+
+## 7. Production Operations
+
+### Clearing Stuck Payouts
+
+If payouts are stuck in `PENDING` or `PROCESSING` due to idempotency lockout (e.g. after a Redis restart or worker crash during processing), they can be manually resolved:
+
+```bash
+# Force-complete stuck payouts on each shard
+docker compose exec backend python manage.py shell --command="
+from payouts.models import Payout
+for shard in ['shard_0', 'shard_1']:
+    count = Payout.objects.using(shard).filter(status__in=['PENDING', 'PROCESSING']).update(status='FAILED')
+    print(f'Cleared {count} payouts in {shard}')
+"
+```
+
+### Full Reset (Wipe All Data)
+
+```bash
+docker compose down -v     # -v removes database volumes
+docker compose up -d --build
+```
+
+This destroys all data and re-seeds fresh demo merchants. Use only when starting from scratch.
+
+### Deployment Checklist
+
+| Step | Command / Action |
+|---|---|
+| Push code | `git push origin main` |
+| Vercel frontend | Auto-deploys on push |
+| EC2 backend | `git pull && docker compose up -d --build` |
+| Verify worker | `docker compose logs -f worker` |
+| Verify backend | `docker compose logs -f backend` |
+| Clear browser cache | Hard refresh + clear Local Storage |

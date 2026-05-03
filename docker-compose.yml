@@ -70,6 +70,9 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     volumes:
+    # WARNING: Node.js 20 actions are deprecated. Actions like checkout@v4 and setup-python@v5 will be forced to run on Node.js 24 starting June 2nd, 2026.
+    # test-backend: Ensure CI workflows are updated to use Node.js 24 or set FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true.
+
       - ./backend:/app
     ports:
       - "8000:8000"            # Only public-facing service on the backend side
