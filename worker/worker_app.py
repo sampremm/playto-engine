@@ -1,5 +1,7 @@
 import os
 import random
+import redis
+import json
 from celery import Celery
 
 # Setup Django before importing models
@@ -8,6 +10,7 @@ import django
 django.setup()
 
 from django.db import transaction
+from django.conf import settings
 from payouts.models import Payout
 from merchants.models import LedgerEntry
 from webhooks.tasks import dispatch_payout_webhook
@@ -16,6 +19,48 @@ app = Celery('worker_app', broker=os.environ.get('REDIS_URL', 'redis://localhost
 
 import logging
 logger = logging.getLogger('payouts')
+
+# ── Redis connection for idempotency key cleanup ──────────────────────────────
+_idem_redis = redis.Redis.from_url(
+    settings.IDEMPOTENCY_REDIS_URL,
+    decode_responses=True,
+)
+
+# Database alias for idempotency keys
+IDEM_DB = getattr(settings, 'IDEMPOTENCY_DB_ALIAS', 'idempotency_db')
+
+# Maximum attempts before force-failing a payout stuck in an idempotency loop
+MAX_LOOP_ATTEMPTS = 5
+
+
+def _clear_idempotency_lock(payout):
+    """
+    Clear stale idempotency locks for a payout that is being force-failed.
+    This prevents the infinite loop where:
+      1. Beat finds PENDING payout → queues task
+      2. Worker sees idempotency lock → exits in 0.0001s
+      3. Payout stays PENDING forever
+    """
+    from payouts.models import IdempotencyKey
+
+    try:
+        # Find and remove any IN_FLIGHT idempotency keys for this merchant
+        stale_keys = IdempotencyKey.objects.using(IDEM_DB).filter(
+            merchant_id=payout.merchant_id,
+            idem_status=IdempotencyKey.STATUS_IN_FLIGHT,
+        )
+        count = stale_keys.count()
+        if count > 0:
+            # Also clear from Redis L1
+            for key_record in stale_keys:
+                rkey = f'idem:{payout.merchant_id}:{key_record.key}'
+                _idem_redis.delete(rkey)
+                logger.info(f"🧹 [WORKER] Cleared Redis idem lock: {rkey}")
+
+            stale_keys.delete()
+            logger.info(f"🧹 [WORKER] Cleared {count} stale idempotency key(s) from PostgreSQL")
+    except Exception as e:
+        logger.warning(f"⚠️ [WORKER] Could not clear idempotency locks: {e}")
 
 
 @app.task(name='worker_app.process_payout', bind=True, max_retries=3)
@@ -41,11 +86,34 @@ def process_payout(self, payout_id):
 
     # Skip if already in a terminal state
     if payout.status not in ['PENDING', 'PROCESSING']:
+        logger.info(f"⏭️ [WORKER] Payout {str(payout_id)[:8]} already in terminal state: {payout.status}")
         return
 
     payout.attempt_count += 1
     short_id = str(payout_id)[:8]
-    
+
+    # ── Idempotency Loop Breaker ──────────────────────────────────────────────
+    # If a payout has been retried too many times without ever advancing past
+    # PENDING, it is stuck in an idempotency loop. Force-fail it and release
+    # the held funds so the dashboard reflects reality.
+    if payout.attempt_count >= MAX_LOOP_ATTEMPTS and payout.status == 'PENDING':
+        logger.warning(
+            f"🔓 [WORKER] Payout {short_id} stuck in PENDING after {payout.attempt_count} attempts. "
+            f"Breaking idempotency loop — force-failing and releasing funds."
+        )
+        _clear_idempotency_lock(payout)
+        with transaction.atomic(using=active_shard):
+            payout.transition_to('PROCESSING', using=active_shard)
+            payout.transition_to('FAILED', using=active_shard)
+            LedgerEntry.objects.using(active_shard).create(
+                merchant=payout.merchant,
+                amount_paise=payout.amount_paise,
+                entry_type='DEBIT_RELEASE',
+                description=f'Refund — idempotency loop breaker for payout {payout.id}'
+            )
+        dispatch_payout_webhook(payout)
+        return
+
     if payout.status == 'PENDING':
         logger.info(f"📥 [WORKER] Starting new payout {short_id}... (Shard: {active_shard})")
         payout.transition_to('PROCESSING', using=active_shard)
@@ -94,7 +162,6 @@ def retry_stuck_payouts():
     """
     from django.utils import timezone
     from datetime import timedelta
-    from django.conf import settings
 
     now = timezone.now()
     # Shards we need to check (including default just in case)
@@ -107,6 +174,7 @@ def retry_stuck_payouts():
             created_at__lt=now - timedelta(seconds=30),
         )
         for payout in orphaned:
+            logger.info(f"🔁 [BEAT] Re-queuing orphaned PENDING payout {str(payout.id)[:8]} (attempt {payout.attempt_count}, shard: {shard})")
             process_payout.delay(str(payout.id))
 
         # ── Case 2: Stuck PROCESSING payouts ──
@@ -115,6 +183,7 @@ def retry_stuck_payouts():
             delay_seconds = 30 * (2 ** payout.attempt_count)
             if payout.updated_at < now - timedelta(seconds=delay_seconds):
                 if payout.attempt_count >= 3:
+                    logger.warning(f"💀 [BEAT] Payout {str(payout.id)[:8]} exceeded max retries — force-failing.")
                     with transaction.atomic(using=shard):
                         payout.transition_to('FAILED', using=shard)
                         LedgerEntry.objects.using(shard).create(
