@@ -25,6 +25,7 @@ REFERRER_POLICY                 = 'strict-origin-when-cross-origin'
 # SECURE_HSTS_PRELOAD           = True
 # SESSION_COOKIE_SECURE         = True
 # CSRF_COOKIE_SECURE            = True
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # ─── Apps ─────────────────────────────────────────────────────────────────────
 INSTALLED_APPS = [
