@@ -1,12 +1,16 @@
-# Playto Payout Engine — Architecture Deep Dive (EXPLAINER)
+# EXPLAINER.md — Playto Payout Engine
+
+> This document answers the five questions from the [Playto Founding Engineer Challenge](https://www.playto.so/features/playto-pay). Every code snippet is from the actual production codebase — no pseudocode.
 
 ---
 
-## 1. The Ledger — Immutable Accounting
+## 1. The Ledger
 
 ### Balance Calculation Query
 
 ```python
+# backend/payouts/views.py — inside PayoutCreateView.post()
+
 current_balance = (
     LedgerEntry.objects.using(active_shard)
     .filter(merchant=locked_merchant)
@@ -14,61 +18,58 @@ current_balance = (
 )
 ```
 
-### Why This Design?
+### Why I Modeled Credits and Debits This Way
 
-This is an **event-sourced ledger** — the canonical pattern used by every major payment company (Stripe, Braintree, Wise). The key insight is that **a balance is not a fact — it is a derived computation**.
+The ledger is **event-sourced** — every money movement is an immutable row. The balance is a derived computation, never a stored field.
 
-Instead of storing a mutable `balance` column and updating it on every transaction, every money movement is stored as an immutable `LedgerEntry` row. The current balance is always derived by summing all entries.
-
-#### Entry Types and Their Meaning
-
-| `entry_type` | `amount_paise` | When Written | Why |
+| `entry_type` | `amount_paise` | When Written | Purpose |
 |---|---|---|---|
-| `CREDIT` | `+10000` | On account top-up / seed | Funds deposited |
-| `DEBIT_HOLD` | `-500` | When payout is **requested** | Reserves funds immediately so balance never over-promises |
-| `DEBIT_FINAL` | `0` | When payout **completes** | No-op — hold already reduced the balance. This entry exists only as an audit marker |
-| `DEBIT_RELEASE` | `+500` | When payout **fails** | Atomically refunds the held amount back into the spendable balance |
+| `CREDIT` | `+10000` | Account top-up / seed | Funds deposited |
+| `DEBIT_HOLD` | `-500` | Payout **requested** | Reserves funds immediately at API time |
+| `DEBIT_FINAL` | `0` | Payout **completed** | Audit marker — hold already reduced balance |
+| `DEBIT_RELEASE` | `+500` | Payout **failed** | Atomically refunds held funds |
 
-#### Why Not a Mutable Balance Column?
+**Why not a mutable `balance` column?**
 
-Consider this failure scenario with a mutable balance:
-
-```
-Transaction A: SELECT balance = 1000
-Transaction A: UPDATE balance = balance - 500  ← crashes here
-Transaction B: SELECT balance = 1000  ← reads stale, undeducted value
-Transaction B: Payout of 500 approved  ← double spend!
-```
-
-With an immutable ledger, this is impossible:
+With a mutable balance, partial failures create drift:
 
 ```
-Transaction A: INSERT LedgerEntry(-500)  ← atomic, either committed or not
-Transaction B: SUM(ledger_entries) = 500  ← sees correct value post-commit
-Transaction B: 402 Insufficient Funds  ← correctly rejected
+Transaction A: UPDATE balance = balance - 500  ← crashes before commit
+Transaction B: SELECT balance = 1000           ← reads stale value
+Result: double-spend
 ```
 
-There is no window for inconsistency. The database guarantees that a committed `INSERT` is immediately visible to other transactions. A partial write is impossible.
+With an immutable ledger, a committed `INSERT` is immediately visible to all transactions. There is no window for inconsistency. The database guarantees it.
 
-#### The `.using(active_shard)` Clause
+**Why `DEBIT_HOLD` at request time, not processing time?**
 
-This is critical. Using `locked_merchant.ledger_entries.aggregate()` via the Django ORM relation silently routes to the **default** database alias. In a two-shard system where a merchant's ledger lives on `shard_1`, this query returns `0` — and every payout passes the balance check regardless of actual balance. The explicit `.using(active_shard)` ensures the query always executes on the correct PostgreSQL instance.
+Funds are reserved the instant the merchant clicks "Withdraw" — not when the worker picks up the task seconds later. This prevents a merchant from submitting multiple payouts that collectively exceed their balance during the gap between API acceptance and worker processing.
+
+**Why `.using(active_shard)` instead of `locked_merchant.ledger_entries.aggregate()`?**
+
+Django's ORM relation `.ledger_entries` silently routes to the `default` database alias when no shard hint is available. In a two-shard system, a merchant whose data lives on `shard_1` would have their ledger entries queried on `default` — returning `0`. Every payout would pass the balance check. The explicit `.using(active_shard)` forces the query to execute on the correct PostgreSQL instance. This was an AI bug I caught (see Section 5).
 
 ---
 
-## 2. The Lock — Preventing Double-Spend
+## 2. The Lock
 
-### The Exact Locking Code
+### The Exact Code That Prevents Double-Spend
 
 ```python
+# backend/payouts/views.py — PayoutCreateView.post(), lines 140-161
+
 from config.routers import ShardRouter
 active_shard = ShardRouter().get_shard(merchant.id)
 
 with transaction.atomic(using=active_shard):
     # Acquire an exclusive row-level lock on the Merchant row
-    locked_merchant = Merchant.objects.using(active_shard).select_for_update().get(pk=merchant.pk)
+    locked_merchant = (
+        Merchant.objects.using(active_shard)
+        .select_for_update()
+        .get(pk=merchant.pk)
+    )
 
-    # Read balance from the correct shard AFTER acquiring the lock
+    # Read balance AFTER acquiring the lock — on the correct shard
     current_balance = (
         LedgerEntry.objects.using(active_shard)
         .filter(merchant=locked_merchant)
@@ -83,144 +84,118 @@ with transaction.atomic(using=active_shard):
         merchant=locked_merchant, amount_paise=amount_paise, status='PENDING'
     )
     LedgerEntry.objects.using(active_shard).create(
-        merchant=locked_merchant, amount_paise=-amount_paise, entry_type='DEBIT_HOLD'
+        merchant=locked_merchant, amount_paise=-amount_paise,
+        entry_type='DEBIT_HOLD',
+        description=f'Hold for payout {payout.id}'
     )
 ```
 
-### The Database Primitive: `SELECT ... FOR UPDATE`
+### What Database Primitive It Relies On
 
-PostgreSQL's row-level lock works as follows:
+**PostgreSQL `SELECT ... FOR UPDATE`** — an exclusive row-level lock.
 
 ```
-Request A (₹60)         Request B (₹60)        [Balance: ₹100]
-─────────────────────────────────────────────────────────────
-BEGIN TRANSACTION       BEGIN TRANSACTION
-SELECT ... FOR UPDATE   SELECT ... FOR UPDATE
-  → acquires lock         → BLOCKS (waits for A)
+Request A (₹60)              Request B (₹60)           [Balance: ₹100]
+────────────────────────────────────────────────────────────────────────
+BEGIN TRANSACTION            BEGIN TRANSACTION
+SELECT ... FOR UPDATE        SELECT ... FOR UPDATE
+  → acquires lock              → BLOCKS (waits for A's lock)
   balance = 100
   100 >= 60 ✅
   INSERT DEBIT_HOLD(-60)
   INSERT PAYOUT
-COMMIT                  → lock released, B unblocks
-                          balance = 40  (reads new state)
-                          40 < 60  ❌
-                        RETURN 402 Insufficient Funds
+COMMIT                       → lock released, B unblocks
+                               balance = 40  (reads committed state)
+                               40 < 60  ❌
+                             RETURN 402 Insufficient Funds
 ```
 
-The key guarantee: **the second request always reads the committed state of the first request**. There is no window between the read and the write where another transaction can interleave.
+The key guarantee: the second request **always reads the committed state of the first**. There is no window between read and write where another transaction can interleave.
 
-### Why Not Application-Level Locking?
-
-Alternatives like Redis `SETNX` locks for application-level mutual exclusion have failure modes:
-- Process crash without releasing the lock → deadlock
-- Clock skew between nodes → premature lock expiry
-- Network partition → split-brain
-
-`SELECT FOR UPDATE` delegates the locking responsibility entirely to PostgreSQL, which has decades of battle-testing for exactly this use case and automatically releases locks on transaction commit/rollback.
+**Why not application-level locking (Redis SETNX)?** PostgreSQL locks are:
+- Automatically released on commit/rollback (no orphan locks)
+- Immune to clock skew and network partitions
+- Decades of battle-testing for exactly this use case
 
 ---
 
-## 3. The Idempotency — Two-Tier Architecture
+## 3. The Idempotency
 
 ### How the System Knows It Has Seen a Key Before
 
-The system uses a **two-tier idempotency store**:
-
-```
-Incoming POST /api/v1/payouts/  [Idempotency-Key: uuid-xyz]
-        │
-        ▼
-┌─────────────────────────────────────────────────────┐
-│  L1: Redis db=1  (sub-millisecond, 99% of traffic)  │
-│  Key: idem:<merchant_id>:<uuid>                     │
-│  TTL: 24 hours                                      │
-└──────────────┬──────────────────────────────────────┘
-               │ Miss (Redis evicted / restarted)
-               ▼
-┌─────────────────────────────────────────────────────┐
-│  L2: PostgreSQL idempotency_db  (ACID, crash-safe)  │
-│  Table: payouts_idempotencykey                      │
-│  Columns: key, merchant_id, idem_status,            │
-│           response_body, response_status            │
-└──────────────┬──────────────────────────────────────┘
-               │ Miss → Process new payout
-               ▼
-         Claim both stores → Create payout → Commit to both
-```
-
-**Why two tiers?**
-- Redis is fast but volatile — a restart wipes all keys
-- PostgreSQL is durable but ~1ms per query vs ~0.1ms for Redis
-- L1 handles 99% of traffic at minimal latency
-- L2 provides crash recovery — if Redis is lost, responses are replayed from PostgreSQL
-
-**Why Redis db=1, not db=0?**
-The Celery broker lives on db=0. A `FLUSHDB` on the broker (legitimate operational action) would simultaneously evict all idempotency keys — converting a maintenance action into a data integrity incident. Isolation prevents this.
-
-### The `SET NX` Primitive
+Two-tier architecture — Redis for speed, PostgreSQL for durability:
 
 ```python
-rkey = f"idem:{merchant.id}:{idempotency_key}"
-claimed = _idem_redis.set(rkey, "__IN_FLIGHT__", ex=86400, nx=True)
+# backend/payouts/views.py — STEP 1: L1 Redis fast path
+rkey = f'idem:{merchant.id}:{idem_key}'
+redis_val = _idem_redis.get(rkey)
+if redis_val is not None:
+    if redis_val == '__IN_FLIGHT__':
+        return Response({'error': 'Concurrent request'}, status=409)
+    cached = json.loads(redis_val)
+    return Response(cached['body'], status=cached['status'])  # Replay
+
+# STEP 2: L2 PostgreSQL fallback (e.g. after Redis restart)
+try:
+    pg_record = IdempotencyKey.objects.using(IDEM_DB).get(
+        key=idem_key, merchant_id=merchant.id
+    )
+    if pg_record.idem_status == 'COMPLETE':
+        # Re-populate Redis cache, then replay
+        _idem_redis.set(rkey, json.dumps({...}), ex=86400)
+        return Response(pg_record.response_body, status=pg_record.response_status)
+    else:
+        return Response({'error': 'Concurrent request'}, status=409)
+except IdempotencyKey.DoesNotExist:
+    pass  # Continue to claim
+
+# STEP 3: Claim atomically in both stores
+redis_claimed = _idem_redis.set(rkey, '__IN_FLIGHT__', ex=86400, nx=True)
+if not redis_claimed:
+    return Response({'error': 'Concurrent request'}, status=409)
+
+pg_record = IdempotencyKey.objects.using(IDEM_DB).create(
+    key=idem_key, merchant_id=merchant.id, idem_status='IN_FLIGHT'
+)
 ```
 
-`SET NX` (Set if Not eXists) is a **single atomic Redis command** — it cannot be split into separate `GET` and `SET` operations. This is critical:
+### What Happens If the First Request Is In-Flight When the Second Arrives
 
-```
-Without SET NX (broken):           With SET NX (correct):
-──────────────────────────         ────────────────────────
-A: GET key → None                  A: SET NX → True (owns it)
-B: GET key → None                  B: SET NX → False (blocked)
-A: SET key → "__IN_FLIGHT__"       → No race possible
-B: SET key → "__IN_FLIGHT__"  ← both "win", two payouts created!
-```
+The system handles this at three levels:
 
-### What Happens at Each Stage
+1. **Redis `SET NX`** — The first request atomically claims the key. `SET NX` is a single Redis command — it cannot be split into separate read + write. The second request's `SET NX` returns `False`.
 
-| Scenario | Redis `GET` | Redis `SET NX` | Action |
-|---|---|---|---|
-| First request | `None` | `True` | Claims key, processes payout |
-| Second (in-flight) | `"__IN_FLIGHT__"` | — | Returns `409 Conflict` |
-| Second (after completion) | `{"body": ..., "status": 201}` | — | Replays exact original response |
-| After Redis restart (L2 hit) | `None` (evicted) | — | PostgreSQL fallback, re-populates L1 |
-| Crash during processing | — | — | Both stores deleted, client retries legitimately |
+2. **Redis `GET` returns `"__IN_FLIGHT__"`** — If the second request arrives after the first has claimed but before it completes, the `GET` returns the sentinel value, and the API returns `409 Conflict`.
 
-### On Returning 409 for In-Flight Requests
+3. **PostgreSQL `IntegrityError`** — If Redis is down and both requests hit PostgreSQL simultaneously, the `unique_together = [['key', 'merchant_id']]` constraint catches the duplicate. The losing request returns `409`.
 
-Returning `409 Conflict` for genuinely concurrent in-flight requests is **standard industry practice** — used by Stripe, Braintree, and Adyen. The alternative — blocking the second connection until the first request completes — risks:
+**Why Redis db=1, not db=0?** Celery's broker uses db=0. A `FLUSHDB` on the broker (legitimate maintenance) would wipe all idempotency keys — converting an ops action into a data integrity incident.
 
-- Long-held database connections under load
-- Client timeouts cascading into retry storms
-- Server thread exhaustion
-
-The `409` tells the client: "I know about your key, processing is underway, retry in a moment." On retry, the client receives the full cached `201` response. This satisfies **eventual idempotency** — the correct semantics for distributed systems.
+**Why 409 for in-flight?** This is standard practice (Stripe, Braintree, Adyen). Blocking the second connection until the first completes risks thread exhaustion and retry storms. `409` tells the client to retry momentarily.
 
 ---
 
-## 4. The State Machine — Transition Guards
+## 4. The State Machine
 
-### Where Illegal Transitions Are Blocked
-
-The state machine is enforced at **two independent layers**. This is intentional defence-in-depth.
-
-#### Layer 1: `LEGAL_TRANSITIONS` + `transition_to()` (Primary)
+### Where `FAILED → COMPLETED` Is Blocked
 
 ```python
-# payouts/models.py
+# backend/payouts/models.py — Payout model
 
 LEGAL_TRANSITIONS = {
     'PENDING':    ['PROCESSING'],
     'PROCESSING': ['COMPLETED', 'FAILED'],
-    'COMPLETED':  [],   # Terminal — no further transitions
-    'FAILED':     [],   # Terminal — no further transitions
+    'COMPLETED':  [],   # Terminal — no further transitions allowed
+    'FAILED':     [],   # Terminal — no further transitions allowed
 }
 
 def transition_to(self, new_status, using=None):
     """
-    The ONLY correct way to change payout status in production code.
+    The ONLY correct way to change payout status.
 
-    Unlike clean()/save(), this method cannot be bypassed by
-    Django's QuerySet.update() — which skips save() entirely.
+    Unlike clean()/save(), this method cannot be skipped by .update().
+    All state changes in the worker must call this instead of setting
+    payout.status directly.
     """
     allowed = self.LEGAL_TRANSITIONS.get(self.status, [])
     if new_status not in allowed:
@@ -235,138 +210,46 @@ def transition_to(self, new_status, using=None):
     self.save(**save_kwargs)
 ```
 
-#### Layer 2: `clean()` + `save()` override (Secondary / Admin Guard)
+**Attempting `FAILED → COMPLETED`:**
+1. `self.status` is `'FAILED'`
+2. `LEGAL_TRANSITIONS['FAILED']` returns `[]`
+3. `'COMPLETED' not in []` → `True`
+4. `raise ValueError("Illegal state transition: FAILED → COMPLETED")`
 
-```python
-def clean(self):
-    """Fallback guard for admin panel, shell usage, and any code that
-    calls save() directly without going through transition_to()."""
-    if self.pk:
-        old_status = Payout.objects.get(pk=self.pk).status
-        allowed = self.LEGAL_TRANSITIONS.get(old_status, [])
-        if old_status != self.status and self.status not in allowed:
-            raise ValueError(f"Illegal state transition from {old_status} to {self.status}")
-
-def save(self, *args, **kwargs):
-    self.clean()
-    super().save(*args, **kwargs)
-```
-
-### Why `transition_to()` Is Necessary (The `.update()` Problem)
-
-Django's `QuerySet.update()` executes a direct `UPDATE` SQL statement, completely bypassing the Python model layer:
-
-```python
-# This bypasses save() AND clean() — the guard is invisible to .update()
-Payout.objects.filter(id=payout_id).update(status='COMPLETED')
-```
-
-Any code using `.update()` — including third-party libraries, Django admin actions, or a developer's quick fix — would silently skip the transition check. By mandating `transition_to()` in the worker and documenting it as the required API, the guard is enforced at the **call site** rather than relying on Python method dispatch.
+**Defence in depth** — there is also a `clean()` + `save()` override that catches illegal transitions from the Django admin or shell. But `transition_to()` is the primary guard because Django's `QuerySet.update()` bypasses `save()` entirely.
 
 ### Complete State Diagram
 
 ```
-                    ┌─────────────────────────┐
-                    │         PENDING         │
-                    │  (Created by API view)  │
-                    └───────────┬─────────────┘
-                                │ transition_to('PROCESSING')
-                                ▼
-                    ┌─────────────────────────┐
-                    │       PROCESSING        │
-                    │  (Worker picked up)     │
-                    └───┬─────────────────┬───┘
-                        │                 │
-          70% success   │                 │  20% failure
-  transition_to('COMPLETED')   transition_to('FAILED')
-                        │                 │
-                        ▼                 ▼
-           ┌────────────────┐   ┌──────────────────┐
-           │   COMPLETED    │   │     FAILED       │
-           │ DEBIT_FINAL    │   │ DEBIT_RELEASE    │
-           │ (terminal)     │   │ (terminal)       │
-           └────────────────┘   └──────────────────┘
-
-10% — PROCESSING but no terminal transition:
-Beat task sees updated_at < now - backoff_delay → requeues
-After 3 attempts → forced to FAILED + DEBIT_RELEASE
+PENDING ──→ PROCESSING ──→ COMPLETED  (85%, DEBIT_FINAL entry)
+                       ──→ FAILED     (15%, atomic DEBIT_RELEASE refund)
+                       ──→ [timeout]  (10%, Beat retries with backoff)
+                                      After 3 attempts → FAILED + refund
 ```
 
 ---
 
-## 5. The AI Audit — Catching Subtle Bugs
+## 5. The AI Audit
 
-### What AI Gave Me (Broken Idempotency)
+### Bug 1: Wrong Database for Balance Aggregation
+
+**What AI gave me:**
 
 ```python
-# AI-generated — contains a check-then-act race condition
-try:
-    idemp_record = IdempotencyKey.objects.get(key=idempotency_key, merchant=merchant)
-    if idemp_record.response_body:
-        return Response(idemp_record.response_body, status=idemp_record.status_code)
-except IdempotencyKey.DoesNotExist:
-    idemp_record = IdempotencyKey.objects.create(key=idempotency_key, merchant=merchant)
-```
-
-### What I Caught
-
-**Race condition 1 — Concurrent first requests:**
-Two requests with the same key arrive simultaneously. Both execute `.get()`, both get `DoesNotExist`, both execute `.create()`. The second `.create()` raises an unhandled `IntegrityError` (unique constraint violation). The client receives a raw 500, not an idempotency replay.
-
-**Race condition 2 — TOCTOU (Time of Check, Time of Use):**
-There is a window between the `.get()` and the `.create()` where a third request could interleave. These are two separate database round-trips, not one atomic operation.
-
-**Bug 3 — No response replay on IntegrityError:**
-Even with a `try/except IntegrityError`, the original code just returned a bare 409 — it didn't fetch and return the already-cached response. The client has no way to know if their request actually succeeded.
-
-### What I Replaced It With (Fix in Three Stages)
-
-**Stage 1 — Handle IntegrityError with response replay:**
-```python
-except IdempotencyKey.DoesNotExist:
-    try:
-        idemp_record = IdempotencyKey.objects.create(
-            key=idempotency_key, merchant=merchant
-        )
-    except IntegrityError:
-        # Another process beat us — fetch and replay their response
-        try:
-            existing = IdempotencyKey.objects.get(
-                key=idempotency_key, merchant=merchant
-            )
-            return Response(existing.response_body, status=existing.response_status)
-        except IdempotencyKey.DoesNotExist:
-            return Response({'error': 'Concurrent request'}, status=409)
-```
-
-**Stage 2 — Replace `.get()` + `.create()` with atomic Redis `SET NX`:**
-```python
-# Single atomic operation — no race window possible
-claimed = _idem_redis.set(rkey, "__IN_FLIGHT__", ex=86400, nx=True)
-if not claimed:
-    val = _idem_redis.get(rkey)
-    if val and val != "__IN_FLIGHT__":
-        cached = json.loads(val)
-        return Response(cached['body'], status=cached['status'])  # Replay
-    return Response({'error': 'Concurrent request'}, status=409)
-```
-
-**Stage 3 (Production) — Two-tier L1/L2 with PostgreSQL fallback:**
-The full production implementation adds a PostgreSQL `idempotency_db` as an ACID-guaranteed fallback when Redis is evicted or restarted, combining the speed of Redis with the durability of PostgreSQL.
-
-### The Other Bug I Caught: Wrong Aggregation DB
-
-AI-generated balance check:
-```python
-# Wrong — uses default DB, not the merchant's shard
+# AI-generated balance check — uses Django's ORM relation
 current_balance = locked_merchant.ledger_entries.aggregate(
     Sum('amount_paise')
 )['amount_paise__sum'] or 0
 ```
 
-The `.ledger_entries` reverse relation uses Django's ORM routing, which defaults to the `default` database alias when no hint is provided. On a real two-shard system, a merchant on `shard_1` would have their ledger entries on `shard_1`, but this query reads from `default` — returning `0`. Every payout would pass the balance check.
+**What I caught:**
 
-**Fixed version:**
+The `.ledger_entries` reverse relation routes to the `default` database alias — not the merchant's shard. On a real two-shard system, a merchant on `shard_1` has their ledger entries on `shard_1`, but this query reads from `default` — returning `0`. **Every payout passes the balance check regardless of actual balance.**
+
+This is a silent data corruption bug. No error is raised. The query succeeds. It just returns the wrong number.
+
+**What I replaced it with:**
+
 ```python
 # Correct — explicitly queries the merchant's shard
 current_balance = (
@@ -376,106 +259,84 @@ current_balance = (
 )
 ```
 
+The explicit `.using(active_shard)` forces the query to execute on the correct PostgreSQL instance.
+
+### Bug 2: Check-Then-Act Race Condition in Idempotency
+
+**What AI gave me:**
+
+```python
+# AI-generated idempotency — classic TOCTOU bug
+try:
+    idemp_record = IdempotencyKey.objects.get(key=idempotency_key, merchant=merchant)
+    if idemp_record.response_body:
+        return Response(idemp_record.response_body, status=idemp_record.status_code)
+except IdempotencyKey.DoesNotExist:
+    idemp_record = IdempotencyKey.objects.create(key=idempotency_key, merchant=merchant)
+```
+
+**What I caught:**
+
+Three problems:
+
+1. **Race condition** — Two requests both execute `.get()`, both get `DoesNotExist`, both execute `.create()`. The second `.create()` raises `IntegrityError`. Client gets a raw 500.
+
+2. **TOCTOU** — Between `.get()` and `.create()` there are two separate DB round-trips. Another request can interleave in that window.
+
+3. **No response replay on collision** — Even if you catch `IntegrityError`, the AI code returned a bare `409` — it never fetched and returned the already-cached response.
+
+**What I replaced it with:**
+
+```python
+# Stage 1: Atomic Redis SET NX — single command, no race window
+claimed = _idem_redis.set(rkey, "__IN_FLIGHT__", ex=86400, nx=True)
+if not claimed:
+    val = _idem_redis.get(rkey)
+    if val and val != "__IN_FLIGHT__":
+        cached = json.loads(val)
+        return Response(cached['body'], status=cached['status'])  # Replay
+    return Response({'error': 'Concurrent request'}, status=409)
+
+# Stage 2: PostgreSQL INSERT with IntegrityError handling
+try:
+    pg_record = IdempotencyKey.objects.using(IDEM_DB).create(
+        key=idem_key, merchant_id=merchant.id, idem_status='IN_FLIGHT'
+    )
+except IntegrityError:
+    _idem_redis.delete(rkey)  # Release Redis claim
+    return Response({'error': 'Concurrent request'}, status=409)
+```
+
+Redis `SET NX` is a single atomic command — it cannot be split into read + write. The PostgreSQL `unique_together` constraint provides a durable safety net.
+
+### Bug 3: Stale Database Connections in Long-Running Workers
+
+This wasn't AI-generated code per se, but an AI-recommended architecture (Celery workers + Neon serverless PostgreSQL) that had a subtle operational failure:
+
+**The problem:** Neon Cloud PostgreSQL aggressively drops idle connections. Celery workers are long-lived processes that hold database connections across tasks. After a period of inactivity, the connection goes stale but Python doesn't know it's dead. The next query silently returns empty results — the worker thinks the payout doesn't exist and exits in 0.0002 seconds.
+
+**The fix:**
+
+```python
+# worker/worker_app.py — called before every DB query
+from django.db import close_old_connections
+
+def _find_payout(payout_uuid, hint_shard=None):
+    close_old_connections()  # Force Django to re-establish stale connections
+    # ... query logic ...
+```
+
+This was discovered through production debugging — the worker logs showed tasks completing in 0.0002s with no error output, which meant the query was succeeding but returning `None`. Adding `close_old_connections()` before every database interaction resolved the issue.
+
 ---
 
-## 6. End-to-End Flow Summary
+## 6. Bonus: What I'm Most Proud Of
 
-```
-Client: POST /api/v1/payouts/
-        Headers: Authorization: Bearer <jwt>
-                 Idempotency-Key: <uuid>
-        Body:    {"amount_paise": 5000, "bank_account_id": "ACC123"}
+The **two-tier idempotency with shard-aware task routing**. Most payout engines have idempotency OR sharding. This system has both, and they work together without conflicting:
 
-API Gateway:
-  1. Authenticate JWT → resolve merchant
-  2. L1: Redis GET → miss
-  3. L2: PostgreSQL GET → miss
-  4. Redis SET NX → claimed
-  5. PostgreSQL INSERT IdempotencyKey (IN_FLIGHT)
-  6. Determine active_shard = ShardRouter().get_shard(merchant.id)
-  7. BEGIN TRANSACTION on active_shard
-  8. SELECT Merchant FOR UPDATE → acquire row lock
-  9. SUM(LedgerEntry on active_shard) → current_balance = 12000
-  10. 12000 >= 5000 ✅
-  11. INSERT Payout (PENDING)
-  12. INSERT LedgerEntry (DEBIT_HOLD, -5000)
-  13. Commit response to Redis + PostgreSQL idempotency stores
-  14. COMMIT TRANSACTION
-  15. transaction.on_commit → try process_payout.delay()
-  16. Return 201 Created {payout_id, status: PENDING}
+- Idempotency keys live on their own dedicated database (`idempotency_db`) — completely isolated from business data shards
+- The API resolves the shard, creates the payout atomically, and passes the shard name directly to the Celery worker
+- If the worker crashes, Beat finds the orphaned payout, knows which shard it's on, and re-dispatches with the shard hint
+- The result: zero orphaned payouts, zero double-charges, zero stale balance reads — across a distributed, sharded system
 
-Celery Worker (within 30s):
-  1. Receive process_payout task
-  2. Find payout across all shards
-  3. transition_to('PROCESSING')
-  4. Simulate bank (random outcome)
-  5a. SUCCESS (70%):
-      transition_to('COMPLETED')
-      INSERT LedgerEntry (DEBIT_FINAL, 0)
-      COMMIT
-      dispatch_payout_webhook(payout)
-  5b. FAILURE (20%):
-      transition_to('FAILED')
-      INSERT LedgerEntry (DEBIT_RELEASE, +5000)
-      COMMIT
-      dispatch_payout_webhook(payout)
-  5c. HANG (10%):
-      Worker schedules automatic retry: apply_async(countdown=30)
-      Beat task also monitors with exponential backoff
-      After 3 attempts → FAILED + DEBIT_RELEASE
-
-Webhook Engine:
-  1. Find all active WebhookEndpoints for merchant
-  2. Create WebhookDelivery (QUEUED)
-  3. POST JSON payload + X-Playto-Signature (HMAC-SHA256)
-  4. On success → SENT (terminal, idempotency guard prevents re-delivery)
-  5. On failure → RETRYING → exponential backoff (30s, 60s, 120s)
-  6. After 3 failures → FAILED (terminal)
-
-Client Dashboard (polling):
-  • Hosted on Vercel (playto-engine-vert.vercel.app)
-  • API calls to playtopay.duckdns.org (EC2 + Nginx + Docker)
-  • vercel.json rewrites handle SPA routing (no 404 on refresh)
-  • Every 60s: fetch balance + payout list
-  • When on Webhooks tab: fetch every 10s
-  • Payout status updates: PENDING → COMPLETED/FAILED
-  • Delivery history: QUEUED → PROCESSING → SENT/FAILED
-```
-
----
-
-## 7. Production Operations
-
-### Clearing Stuck Payouts
-
-If payouts are stuck in `PENDING` or `PROCESSING` due to idempotency lockout (e.g. after a Redis restart or worker crash during processing), they can be manually resolved:
-
-```bash
-# Force-complete stuck payouts on each shard
-docker compose exec backend python manage.py shell --command="
-from payouts.models import Payout
-for shard in ['shard_0', 'shard_1']:
-    count = Payout.objects.using(shard).filter(status__in=['PENDING', 'PROCESSING']).update(status='FAILED')
-    print(f'Cleared {count} payouts in {shard}')
-"
-```
-
-### Full Reset (Wipe All Data)
-
-```bash
-docker compose down -v     # -v removes database volumes
-docker compose up -d --build
-```
-
-This destroys all data and re-seeds fresh demo merchants. Use only when starting from scratch.
-
-### Deployment Checklist
-
-| Step | Command / Action |
-|---|---|
-| Push code | `git push origin main` |
-| Vercel frontend | Auto-deploys on push |
-| EC2 backend | `git pull && docker compose up -d --build` |
-| Verify worker | `docker compose logs -f worker` |
-| Verify backend | `docker compose logs -f backend` |
-| Clear browser cache | Hard refresh + clear Local Storage |
+This is the kind of infrastructure I want to build at Playto.

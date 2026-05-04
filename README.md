@@ -1,125 +1,134 @@
 # Playto Payout Engine
 
-A production-grade, distributed payout infrastructure with idempotency, concurrency safety, async processing, and a real-time webhook delivery engine — all backed by a premium React dashboard.
+A production-grade, distributed payout infrastructure built for the [Playto Founding Engineer Challenge 2026](https://www.playto.so/features/playto-pay). Features sharded PostgreSQL, two-tier idempotency, atomic concurrency control, async processing with Celery, HMAC-signed webhooks, and a glassmorphic React dashboard.
 
-> **Live Demo:** Frontend → [playto-engine-vert.vercel.app](https://playto-engine-vert.vercel.app) · API → [playtopay.duckdns.org](https://playtopay.duckdns.org)
-
----
-
-## 🏗️ Architecture & Stack
-
-### Backend (Django API)
-| Layer | Technology |
-|---|---|
-| Framework | Django 4.2 + Django REST Framework |
-| Auth | JWT via `djangorestframework-simplejwt` |
-| Database | PostgreSQL — multi-shard (`default`, `shard_0`, `shard_1`) |
-| Idempotency Store | PostgreSQL `idempotency_db` (L2 durable) + Redis `db=1` (L1 fast cache) |
-| Concurrency | `SELECT FOR UPDATE` row lock inside `transaction.atomic()` |
-| Rate Limiting | DRF `UserRateThrottle` — 300 req/min authenticated |
-
-### Background Worker (Celery)
-| Layer | Technology |
-|---|---|
-| Task Queue | Celery 5 + Redis `db=0` (broker) |
-| Scheduler | Celery Beat — sweeps every 30s for orphaned/stuck payouts |
-| Retry Logic | Exponential backoff: `30s → 120s → 600s`, max 3 attempts |
-| Shard Awareness | Worker checks all shards (`default`, `shard_0`, `shard_1`) for payouts |
-
-### Webhook Engine
-| Feature | Detail |
-|---|---|
-| Lifecycle | `QUEUED → PROCESSING → RETRYING → SENT/FAILED` |
-| Signing | `X-Playto-Signature: sha256=<hmac>` on every delivery |
-| Idempotency Guard | Exits immediately if delivery is already `SENT` |
-| Broker Resilience | Task enqueue failure is non-fatal — Beat recovers the payout |
-
-### Frontend (React + Vite)
-| Feature | Detail |
-|---|---|
-| Framework | React 19 + Vite |
-| Styling | Tailwind CSS v4 (Vite plugin) |
-| UI | Glassmorphic SaaS dashboard |
-| Smart Polling | 60s on standard tabs, 10s when Webhooks tab is active |
-| Icons | Lucide React |
+> **Live Demo:** Frontend → [playto-engine-vert.vercel.app](https://playto-engine-vert.vercel.app) · API → [playtopay.duckdns.org](http://playtopay.duckdns.org:8000)
 
 ---
 
-## 💡 Core Engineering Solutions
-
-### 1. Two-Tier Idempotency (L1 Redis + L2 PostgreSQL)
+## Architecture Overview
 
 ```
-Request arrives with Idempotency-Key header
+┌──────────────────────────┐        ┌───────────────────────────────────────┐
+│   Vercel (Frontend)      │        │   AWS EC2 (Backend)                   │
+│   React 19 + Vite        │  HTTP  │   Docker Compose                      │
+│   Glassmorphic Dashboard │───────→│   ┌─────────────────────────────────┐ │
+│   JWT Auth + Polling     │        │   │  Django API (:8000)             │ │
+└──────────────────────────┘        │   │  SELECT FOR UPDATE locking      │ │
+                                    │   │  Two-Tier Idempotency (L1+L2)   │ │
+                                    │   └───────────┬─────────────────────┘ │
+                                    │               │ Redis (broker)        │
+                                    │   ┌───────────▼─────────────────────┐ │
+                                    │   │  Celery Worker                  │ │
+                                    │   │  Shard-aware payout processing  │ │
+                                    │   │  State machine enforcement      │ │
+                                    │   ├─────────────────────────────────┤ │
+                                    │   │  Celery Beat (every 30s)        │ │
+                                    │   │  Orphan recovery + retry logic  │ │
+                                    │   └───────────┬─────────────────────┘ │
+                                    │               │                       │
+                                    │   ┌───────────▼─────────────────────┐ │
+                                    │   │  PostgreSQL Shards (Neon Cloud) │ │
+                                    │   │  shard_0 · shard_1 · idem_db   │ │
+                                    │   └─────────────────────────────────┘ │
+                                    └───────────────────────────────────────┘
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| **API** | Django 4.2 + Django REST Framework |
+| **Auth** | JWT via `djangorestframework-simplejwt` |
+| **Database** | PostgreSQL (Neon Cloud) — sharded: `shard_0`, `shard_1`, `idempotency_db` |
+| **Task Queue** | Celery 5 + Redis (broker on db=0) |
+| **Scheduler** | Celery Beat — orphan sweep every 30 seconds |
+| **Idempotency** | Redis db=1 (L1 cache) + PostgreSQL (L2 durable store) |
+| **Concurrency** | `SELECT FOR UPDATE` row-level locking inside `transaction.atomic()` |
+| **Webhooks** | HMAC-SHA256 signed delivery with exponential backoff retries |
+| **Frontend** | React 19 + Vite + Tailwind CSS v4 |
+| **CI/CD** | GitHub Actions → Docker Hub → EC2 auto-deploy |
+| **Infrastructure** | AWS EC2, Neon PostgreSQL, Redis, Vercel, DuckDNS |
+
+---
+
+## Core Engineering
+
+### 1. Money Integrity — Immutable Ledger
+
+Balance is **never stored as a field** — it is always derived:
+
+```python
+balance = LedgerEntry.objects.using(shard).filter(merchant=m).aggregate(Sum('amount_paise'))
+```
+
+| Entry Type | Amount | When | Purpose |
+|---|---|---|---|
+| `CREDIT` | `+10000` | Account top-up | Funds deposited |
+| `DEBIT_HOLD` | `-500` | Payout requested | Reserves funds immediately |
+| `DEBIT_FINAL` | `0` | Payout completed | Audit marker (hold already reduced balance) |
+| `DEBIT_RELEASE` | `+500` | Payout failed | Atomic refund of held funds |
+
+All amounts stored as `BigIntegerField` in **paise** (1 INR = 100 paise). No floats. No decimals.
+
+### 2. Concurrency — SELECT FOR UPDATE
+
+Two simultaneous ₹60 requests against ₹100 balance:
+
+```
+Request A: acquires row lock → reads ₹100 → deducts ₹60 → commits
+Request B: waits for lock    → reads ₹40  → returns 402 Insufficient Funds ✅
+```
+
+### 3. Idempotency — Two-Tier L1/L2
+
+```
+Request with Idempotency-Key header
     │
     ▼
-[L1] Redis SET NX  ──── hit (SENT) ──→ Replay cached JSON (0ms)
+[L1] Redis SET NX ──── hit → Replay cached JSON (0ms)
     │ miss
     ▼
-[L2] PostgreSQL SELECT ──── hit ──────→ Replay stored response (~1ms)
+[L2] PostgreSQL SELECT ──── hit → Re-populate Redis, replay (~1ms)
     │ miss
     ▼
-Process new payout → commit to both stores simultaneously
+Process new payout → commit to both stores
 ```
 
-- **Redis `db=1`** is isolated from Celery's `db=0` — a broker flush never evicts idempotency locks.
-- **PostgreSQL `idempotency_db`** is a separate alias from business data — independent migrations, routing, and crash recovery.
-- Key format: `idem:<merchant_id>:<uuid>` with 24-hour TTL.
-
-### 2. Immutable Ledger
-
-Balance is never stored — it is computed at query time as `SUM(amount_paise)`:
-
-| Entry Type | When | Sign |
-|---|---|---|
-| `CREDIT` | Funds added to account | `+` |
-| `DEBIT_HOLD` | Payout requested, funds reserved | `−` |
-| `DEBIT_FINAL` | Payout completed (no-op — hold already reduced balance) | `0` |
-| `DEBIT_RELEASE` | Payout failed — refund written atomically | `+` |
-
-### 3. No Double-Spend (SELECT FOR UPDATE)
-
-Two simultaneous 60₹ requests against a 100₹ balance:
+### 4. State Machine
 
 ```
-Request A: acquires row lock → reads 100₹ → deducts 60₹ → commits
-Request B: waits for lock → reads 40₹ → returns 402 Insufficient Funds ✅
+PENDING → PROCESSING → COMPLETED (85%, bank success)
+                     → FAILED    (15%, bank rejection → auto-refund)
+                     → [hangs]   (10%, timeout → Beat retry with backoff → force-fail after 3)
 ```
 
-Proven by `test_simultaneous_payouts` — passes on every run.
+Illegal transitions (e.g. `FAILED → COMPLETED`) blocked by `transition_to()` in model.
 
-### 4. Payout State Machine
+### 5. Retry & Recovery
 
-```
-PENDING ──→ PROCESSING ──→ COMPLETED  (70%, DEBIT_FINAL entry)
-                       ──→ FAILED     (20%, DEBIT_RELEASE refund)
-                       ──→ [hangs]    (10%, Beat requeues within 30s)
-```
-
-Illegal transitions (e.g. `FAILED → COMPLETED`) are blocked by `transition_to()` — the mandatory path for all status changes in production code. Django's `.update()` bypasses `save()`, so `transition_to()` is the only truly unbypassable guard.
-
-### 5. Broker-Resilient Task Dispatch
-
-`process_payout.delay()` is called inside `transaction.on_commit()`. If the Celery broker is temporarily unreachable:
-- The **task enqueue silently fails** (non-fatal `try/except`).
-- The payout is still written to the DB as `PENDING`.
-- **Celery Beat** picks it up within 30 seconds via `retry_stuck_payouts`.
-- Result: **zero orphaned payouts**, even during worker restarts.
+- **Celery Beat** sweeps every 30s for orphaned PENDING payouts and stuck PROCESSING payouts
+- **Exponential backoff**: 30s → 60s → 120s between retries
+- **Max 3 attempts** → force-fail with atomic `DEBIT_RELEASE` refund
+- **`close_old_connections()`** before every DB query (critical for Neon serverless connections)
+- **`acks_late=True`** — if worker crashes mid-task, message returns to Redis
 
 ---
 
-## 🚀 How to Run
+## Quick Start
 
-### Option A: Docker (Recommended)
+### Option A: Docker Compose (Recommended)
 
 ```bash
-# Clone and start everything
 git clone https://github.com/sampremm/playto-engine.git
 cd playto-engine
+cp .env.example .env  # Edit with your credentials
 docker compose up -d --build
 ```
 
-The backend entrypoint script automatically handles migrations, seeding, and database readiness checks. No manual setup needed.
+The entrypoint script automatically runs migrations across all 4 database aliases and seeds demo merchants.
 
 ### Option B: Local Development
 
@@ -129,7 +138,7 @@ brew services start postgresql@15
 brew services start redis
 ```
 
-#### Environment — `.env` (project root)
+#### Environment (`.env` in project root)
 ```env
 SECRET_KEY=your-secret-key
 DATABASE_URL=postgres://<user>@localhost:5432/postgres
@@ -139,7 +148,7 @@ IDEMPOTENCY_DB_URL=postgres://<user>@localhost:5432/postgres
 REDIS_URL=redis://localhost:6379/0
 IDEMPOTENCY_REDIS_URL=redis://localhost:6379/1
 ALLOWED_HOSTS=localhost,127.0.0.1
-CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+CORS_ALLOWED_ORIGINS=http://localhost:5173
 ```
 
 #### Terminal 1 — Django API
@@ -157,7 +166,6 @@ python manage.py runserver
 
 #### Terminal 2 — Celery Worker + Beat
 ```bash
-cd /path/to/Payto-pay
 source .venv/bin/activate
 export PYTHONPATH=./backend
 export DJANGO_SETTINGS_MODULE=config.settings
@@ -167,14 +175,13 @@ celery -A worker.worker_app worker -l info -B
 #### Terminal 3 — React Frontend
 ```bash
 cd frontend
-npm install
-npm run dev
+npm install && npm run dev
 # → http://localhost:5173
 ```
 
 ---
 
-## 🔐 Test Accounts (seeded)
+## Test Accounts (Seeded)
 
 | Email | Password |
 |---|---|
@@ -184,102 +191,97 @@ npm run dev
 
 ---
 
-## 📡 API Reference
+## API Reference
 
 All endpoints (except login) require: `Authorization: Bearer <token>`
 
-| Method | Endpoint | Notes |
+| Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/v1/auth/login/` | Returns `access` + `refresh` tokens |
-| `GET` | `/api/v1/merchants/balance/` | `available_rupees`, `held_rupees` |
-| `GET` | `/api/v1/merchants/ledger/` | Full append-only ledger |
-| `POST` | `/api/v1/payouts/` | Requires `Idempotency-Key: <uuid>` header |
+| `POST` | `/api/v1/auth/login/` | Returns `access` + `refresh` JWT tokens |
+| `GET` | `/api/v1/merchants/balance/` | Available + held balance in rupees |
+| `GET` | `/api/v1/merchants/ledger/` | Full append-only ledger history |
+| `POST` | `/api/v1/payouts/` | Create payout (requires `Idempotency-Key: <uuid>` header) |
 | `GET` | `/api/v1/payouts/list/` | All payouts for authenticated merchant |
 | `POST` | `/api/v1/webhooks/endpoints/` | Register webhook URL |
 | `GET` | `/api/v1/webhooks/endpoints/` | List registered endpoints |
-| `DELETE` | `/api/v1/webhooks/endpoints/` | Delete endpoint (body: `{"id": "..."}`) |
-| `GET` | `/api/v1/webhooks/deliveries/` | Full delivery history + lifecycle states |
+| `DELETE` | `/api/v1/webhooks/endpoints/` | Delete endpoint |
+| `GET` | `/api/v1/webhooks/deliveries/` | Delivery history with lifecycle states |
 
 ---
 
-## 🧪 Running Tests
+## Running Tests
 
 ```bash
 cd backend
-source ../.venv/bin/activate
 python manage.py test payouts.tests --verbosity=2
 ```
 
-### Test Results (3/3 passing ✅)
-
 | Test | What It Proves |
 |---|---|
-| `test_same_key_returns_same_response` | Redis L1 idempotency — duplicate request returns same payout ID, zero double-entries |
+| `test_same_key_returns_same_response` | Duplicate Idempotency-Key returns same payout ID, zero duplicate entries |
 | `test_different_key_creates_new_payout` | Different keys create independent payouts |
-| `test_simultaneous_payouts` | `SELECT FOR UPDATE` prevents double-spend — exactly one 201, one 402 |
-
-```
-System check identified no issues (0 silenced).
-test_simultaneous_payouts (payouts.tests.test_concurrency.ConcurrencyTest.test_simultaneous_payouts)
-Two 60-rupee payout requests against a 100-rupee balance. ... ok
-test_different_key_creates_new_payout (payouts.tests.test_idempotency.IdempotencyTest.test_different_key_creates_new_payout)
-Two requests with different Idempotency-Keys must create ... ok
-test_same_key_returns_same_response (payouts.tests.test_idempotency.IdempotencyTest.test_same_key_returns_same_response)
-Second call with the same Idempotency-Key must return the exact ... ok
-
-----------------------------------------------------------------------
-Ran 3 tests in 0.993s
-
-OK ✅
-```
+| `test_simultaneous_payouts` | `SELECT FOR UPDATE` prevents double-spend — one 201, one 402 |
 
 ---
 
-## 🐳 Docker Compose Services
+## CI/CD Pipeline
 
+```
+git push origin main
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  GitHub Actions                              │
+│  1. test-backend: Run Django tests (Pg+Redis)│
+│  2. docker-build: Push images to Docker Hub  │
+│  3. deploy-ec2:   SSH → pull → restart       │
+└─────────────────────────────────────────────┘
+```
+
+Tests run against real PostgreSQL and Redis services in CI — no SQLite mocks.
+
+---
+
+## Production Deployment
+
+| Component | Platform | URL |
+|---|---|---|
+| Frontend | Vercel | `playto-engine-vert.vercel.app` |
+| Backend | AWS EC2 + Docker | `playtopay.duckdns.org:8000` |
+| Database | Neon PostgreSQL | 2 shards + idempotency DB |
+| DNS | DuckDNS | Dynamic DNS → EC2 |
+
+### Environment Variables (Vercel)
+```
+VITE_API_BASE_URL=http://playtopay.duckdns.org:8000
+```
+
+### Deploy
 ```bash
-docker compose up -d --build
+git push origin main  # CI/CD handles everything
 ```
-
-| Service | Image | Purpose | Exposed Port |
-|---|---|---|---|
-| `shard_0` | `postgres:15-alpine` | Business data shard (even merchant IDs) | Internal only |
-| `shard_1` | `postgres:15-alpine` | Business data shard (odd merchant IDs) | Internal only |
-| `idempotency_db` | `postgres:15-alpine` | ACID idempotency key store | Internal only |
-| `redis` | `redis:7-alpine` | Celery broker (db=0) + idem cache (db=1) | Internal only |
-| `backend` | Custom (Python 3.11) | Django API server | `:8000` |
-| `worker` | Custom (Python 3.11) | Celery worker + Beat scheduler | None |
-
-The backend entrypoint (`docker-entrypoint.sh`) automatically waits for PostgreSQL readiness, runs all migrations across shards, and seeds demo data.
 
 ---
 
-## 🌐 Production Deployment
-
-### Architecture
+## Project Structure
 
 ```
-┌─────────────────────────┐        ┌──────────────────────────────────────┐
-│  Vercel (Frontend)      │        │  AWS EC2 (Backend)                   │
-│  playto-engine-vert     │  HTTPS │  playtopay.duckdns.org               │
-│  .vercel.app            │───────→│  Nginx (TLS termination)             │
-│                         │        │    ↓ proxy_pass :8000                │
-│  vercel.json rewrites   │        │  Docker Compose                     │
-│  SPA routing fallback   │        │    backend + worker + DBs + Redis   │
-└─────────────────────────┘        └──────────────────────────────────────┘
+playto-engine/
+├── backend/
+│   ├── config/           # Django settings, routers, URLs
+│   │   ├── settings.py   # 4 DB aliases, JWT, CORS, throttling
+│   │   └── routers.py    # ShardRouter (merchant_id → shard_0/shard_1)
+│   ├── merchants/        # Merchant model + LedgerEntry
+│   ├── payouts/          # Payout model + IdempotencyKey + views
+│   │   ├── views.py      # PayoutCreateView (two-tier idem + locking)
+│   │   ├── models.py     # State machine (transition_to)
+│   │   └── tests/        # Concurrency + idempotency tests
+│   └── webhooks/         # HMAC-signed webhook delivery engine
+├── worker/
+│   ├── worker_app.py     # Celery tasks (process_payout + beat sweeper)
+│   └── Dockerfile        # Non-root celery user
+├── frontend/
+│   └── src/              # React dashboard (Login + Dashboard)
+├── docker-compose.yml    # Full local orchestration (7 services)
+└── .github/workflows/    # CI/CD pipeline
 ```
-
-### Frontend (Vercel)
-
-- **Environment Variable:** `VITE_API_BASE_URL=https://playtopay.duckdns.org`
-- **SPA Routing:** `frontend/vercel.json` rewrites all paths to `index.html`
-- Redeploy after changing env vars (Vite bakes them at build time)
-
-### Backend (EC2 + Docker)
-
-- **Domain:** `playtopay.duckdns.org` (DuckDNS dynamic DNS)
-- **TLS:** Nginx handles SSL termination, proxies to Django on `:8000`
-- **Django Config:**
-  - `SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')` in `settings.py`
-  - `ALLOWED_HOSTS` and `CORS_ALLOWED_ORIGINS` in `.env` include both the DuckDNS domain and Vercel origin
-- **Deploy:** `git pull && docker compose up -d --build`

@@ -2,13 +2,13 @@
 
 ## Executive Summary
 
-Playto Payout Engine is a production-grade distributed payment processing system. It solves three hard problems in financial infrastructure:
+The Playto Payout Engine is a distributed payment processing system designed for the [Playto Founding Engineer Challenge](https://www.playto.so/features/playto-pay). It solves three hard problems in financial infrastructure:
 
-1. **Idempotency** — Ensuring that retried or duplicated API calls never result in duplicate money movements, even under concurrent load.
-2. **Concurrency Safety** — Preventing double-spend when multiple requests arrive simultaneously for the same account.
-3. **Reliability** — Ensuring every payout eventually reaches a terminal state (COMPLETED or FAILED) and every state change triggers a notification, even when components fail.
+1. **Idempotency** — Duplicate API calls never create duplicate money movements, even under concurrent load.
+2. **Concurrency Safety** — Double-spend is impossible when multiple requests arrive simultaneously for the same account.
+3. **Reliability** — Every payout eventually reaches a terminal state (COMPLETED or FAILED), even when components crash mid-processing.
 
-The system is intentionally over-engineered relative to a simple CRUD app. Every architectural decision maps to a real-world payment infrastructure pattern used at scale.
+Every architectural decision maps to a real-world payment infrastructure pattern used at scale by companies like Stripe, Wise, and Razorpay.
 
 ---
 
@@ -20,7 +20,7 @@ The system is intentionally over-engineered relative to a simple CRUD app. Every
 │  React 19 + Vite + Tailwind v4 — Glassmorphic SaaS Dashboard       │
 │  • JWT auth   • Idempotency-Key per submission   • Smart polling    │
 └────────────────────────────┬────────────────────────────────────────┘
-                             │ HTTPS
+                             │ HTTP
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        API GATEWAY (Django)                         │
@@ -30,27 +30,30 @@ The system is intentionally over-engineered relative to a simple CRUD app. Every
 │  │  L1: Redis db=1     │  │  Balance verified on correct shard   │  │
 │  │  L2: PG idem_db     │  │  Payout + Hold written atomically    │  │
 │  └─────────────────────┘  └──────────────────────────────────────┘  │
+│                                                                     │
+│  Task dispatch: process_payout.apply_async([id, shard], countdown=2)│
 └────────────────────────────┬────────────────────────────────────────┘
                              │ Celery task via Redis db=0 (broker)
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    PAYOUT PROCESSOR (Celery Worker)                 │
-│  Shard-aware lookup → transition_to() state machine → atomic writes │
+│  UUID→string cast · close_old_connections() · shard-aware lookup    │
+│  transition_to() state machine · atomic DB writes                   │
 │  ┌─────────────────────────────────────────────────────────────┐    │
-│  │  Celery Beat (scheduler, every 30s)                         │    │
-│  │  • Picks up PENDING payouts orphaned by broker failures     │    │
-│  │  • Retries — PROCESSING but no terminal transition:         │    │
-│  │    Worker schedules automatic retry via apply_async(countdown=30) │
-│  │    Beat task also monitors with exponential backoff         │    │
-│  │    After 3 attempts → forced to FAILED + DEBIT_RELEASE      │    │
+│  │  Celery Beat (dedicated container, every 30s)               │    │
+│  │  • Picks up orphaned PENDING payouts                        │    │
+│  │  • Retries stuck PROCESSING with exponential backoff        │    │
+│  │  • Force-fails after 3 attempts + atomic DEBIT_RELEASE      │    │
+│  │  • Passes shard hint to avoid cross-shard hunting           │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 └────────────────────────────┬────────────────────────────────────────┘
-                             │ HTTP POST + HMAC signature
+                             │ HTTP POST + HMAC-SHA256 signature
                              ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     WEBHOOK ENGINE (Django + Celery)                │
 │  WebhookDelivery lifecycle: QUEUED→PROCESSING→RETRYING→SENT/FAILED  │
 │  Idempotency guard prevents re-delivery after SENT                  │
+│  HMAC signing: X-Playto-Signature: sha256=<digest>                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,335 +61,240 @@ The system is intentionally over-engineered relative to a simple CRUD app. Every
 
 ## Database Architecture
 
-### Four Aliases, Four Purposes
+### Sharding Strategy
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  default          → Merchants, Auth, Webhooks            │
-│                     (reads/writes for non-shard models)  │
-├──────────────────────────────────────────────────────────┤
-│  shard_0          → Payouts + LedgerEntries              │
-│                     (even merchant_id % 2 == 0)          │
-├──────────────────────────────────────────────────────────┤
-│  shard_1          → Payouts + LedgerEntries              │
-│                     (odd merchant_id % 2 == 1)           │
-├──────────────────────────────────────────────────────────┤
-│  idempotency_db   → IdempotencyKey records only          │
-│                     (ACID audit store, isolated by design)│
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  shard_0          → Payouts + LedgerEntries                  │
+│                     (md5(merchant_id) % 2 == 0)              │
+├──────────────────────────────────────────────────────────────┤
+│  shard_1          → Payouts + LedgerEntries                  │
+│                     (md5(merchant_id) % 2 == 1)              │
+├──────────────────────────────────────────────────────────────┤
+│  idempotency_db   → IdempotencyKey records only              │
+│                     (ACID audit store, isolated by design)    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Locally (development), all four aliases point to the same PostgreSQL server for convenience. In production Docker, each is a separate container. The application code never assumes they share a server.
+**Production:** Each alias points to a separate Neon Cloud PostgreSQL database. Shard routing uses `md5(merchant_id) % 2` via `ShardRouter` in `config/routers.py`.
 
 ### The ShardRouter
 
-`config/routers.py` implements a custom Django database router:
-
 ```python
+# config/routers.py
 class ShardRouter:
-    SHARD_COUNT = 2
-    IDEMPOTENCY_MODELS = {'idempotencykey'}
-    SHARD_MODELS = {'payout', 'ledgerentry'}
-
     def get_shard(self, merchant_id):
-        return f'shard_{int(merchant_id) % self.SHARD_COUNT}'
+        shard_id = int(hashlib.md5(str(merchant_id).encode()).hexdigest(), 16) % 2
+        return f'shard_{shard_id}'
 
     def db_for_read(self, model, **hints):
-        name = model.__name__.lower()
-        if name in self.IDEMPOTENCY_MODELS:
+        if model.__name__.lower() in {'idempotencykey'}:
             return 'idempotency_db'
-        if name in self.SHARD_MODELS:
-            instance = hints.get('instance')
-            if instance:
-                merchant_id = getattr(instance, 'merchant_id', None) or \
-                              getattr(getattr(instance, 'merchant', None), 'id', None)
-                if merchant_id:
-                    return self.get_shard(merchant_id)
+        if model._meta.app_label in ['merchants', 'payouts', 'webhooks']:
+            # Extract merchant_id from instance or hints
+            merchant_id = ...  # resolved from hints
+            if merchant_id:
+                return self.get_shard(merchant_id)
         return None  # Fall through to default
-
-    def allow_migrate(self, db, app_label, model_name=None, **hints):
-        if model_name == 'idempotencykey':
-            return db == 'idempotency_db'
-        if db == 'idempotency_db':
-            return False
-        return True
 ```
-
-The router's `db_for_read` is consulted by Django's ORM on every query. It uses the `instance` hint (when available) to determine the correct shard for a given object. In the views and worker, we resolve `active_shard` explicitly at the start of each operation to avoid relying on hints (which are not always present).
 
 ### The Immutable Ledger
 
-`LedgerEntry` is the single source of truth for all account state:
+Balance is always computed — never stored:
 
 ```python
 class LedgerEntry(models.Model):
-    ENTRY_TYPES = [
-        ('CREDIT',         'Credit — funds added'),
-        ('DEBIT_HOLD',     'Debit Hold — funds reserved'),
-        ('DEBIT_FINAL',    'Debit Final — payout confirmed'),
-        ('DEBIT_RELEASE',  'Debit Release — refund on failure'),
-    ]
-    merchant    = models.ForeignKey(Merchant, related_name='ledger_entries')
+    merchant     = models.ForeignKey(Merchant, on_delete=models.PROTECT)
     amount_paise = models.BigIntegerField()  # Negative for debits
-    entry_type  = models.CharField(max_length=20, choices=ENTRY_TYPES)
-    description = models.TextField(blank=True)
-    created_at  = models.DateTimeField(auto_now_add=True)
+    entry_type   = models.CharField(max_length=20, choices=ENTRY_TYPES)
+    created_at   = models.DateTimeField(auto_now_add=True)
 ```
 
-The balance is always computed as:
 ```python
 balance_paise = LedgerEntry.objects.using(active_shard).filter(
     merchant=merchant
 ).aggregate(total=Sum('amount_paise'))['total'] or 0
 ```
 
-This approach guarantees zero balance inconsistency — there is no mutable field that can drift from the ledger state.
+This guarantees zero balance drift — there is no mutable field that can get out of sync with the ledger.
 
 ---
 
 ## Phase 1: The API Gateway
 
-### Request Lifecycle (PayoutCreateView.post)
+### Request Lifecycle (`PayoutCreateView.post`)
 
 ```
-Request arrives
+Request arrives with Idempotency-Key header
     │
     ▼
-1. Validate inputs
-   • amount_paise: present, positive integer
-   • bank_account_id: present
-   • Idempotency-Key header: present, valid UUID
+1. Validate inputs (amount_paise, bank_account_id, UUID header)
     │
     ▼
 2. L1 Redis fast-path check
    GET idem:<merchant_id>:<uuid>
-   ├── "__IN_FLIGHT__"  → 409 Conflict (in-progress)
-   ├── JSON response   → Replay 201/402 (cache hit)
-   └── None            → Miss, continue
+   ├── "__IN_FLIGHT__"  → 409 Conflict
+   ├── JSON response    → Replay cached 201/402
+   └── None             → Miss, continue
     │
     ▼
 3. L2 PostgreSQL fallback (e.g. after Redis restart)
    SELECT * FROM idempotencykey WHERE key=... AND merchant_id=...
-   ├── COMPLETE        → Re-populate Redis, replay response
-   ├── IN_FLIGHT       → Populate Redis sentinel, 409 Conflict
-   └── DoesNotExist    → Miss, continue
+   ├── COMPLETE          → Re-populate Redis, replay response
+   ├── IN_FLIGHT         → 409 Conflict
+   └── DoesNotExist      → Miss, continue
     │
     ▼
 4. Claim key atomically in both stores
-   Redis: SET NX → False? → 409 (race lost)
-   PostgreSQL: INSERT → IntegrityError? → fetch existing → replay
+   Redis: SET NX → False? → 409
+   PostgreSQL: INSERT → IntegrityError? → 409
     │
     ▼
-5. Resolve active shard
-   active_shard = ShardRouter().get_shard(merchant.id)
+5. Resolve shard: active_shard = ShardRouter().get_shard(merchant.id)
     │
     ▼
 6. BEGIN TRANSACTION on active_shard
-   SELECT Merchant FOR UPDATE → acquires row lock
+   SELECT Merchant FOR UPDATE → acquires exclusive row lock
    SUM(LedgerEntry using active_shard) → current_balance
-   insufficient? → commit 402 to idempotency stores, return
+   insufficient? → commit 402 to idempotency stores → return
     │
     ▼
 7. Create Payout (PENDING) + LedgerEntry (DEBIT_HOLD) — atomic
     │
     ▼
-8. _commit() — write final response to both idempotency stores
+8. Commit response to both idempotency stores
     │
     ▼
 9. COMMIT TRANSACTION
-   transaction.on_commit → _enqueue_safe(payout.id)
     │
     ▼
-10. Return 201 Created
+10. process_payout.apply_async([payout_id, shard], countdown=2)
+    │
+    ▼
+11. Return 201 Created
 ```
 
-### The `_enqueue_safe` Pattern
+### Task Dispatch with Shard Hint
 
 ```python
-def _enqueue_safe(payout_id):
-    """
-    Best-effort task enqueue. If the Celery broker is temporarily
-    unreachable, the Beat task retry_stuck_payouts will pick up
-    the PENDING payout within 30 seconds.
-
-    The payout is ALREADY committed to the database at this point.
-    A broker failure here is non-fatal — it just means the payout
-    is processed a few seconds later than immediately.
-    """
-    try:
-        process_payout.delay(payout_id)
-    except Exception:
-        pass  # Non-fatal
-
-transaction.on_commit(lambda: _enqueue_safe(str(payout.id)))
+# The API knows which shard it just wrote to — pass it to the worker
+process_payout.apply_async(
+    args=[str(payout.id), active_shard], countdown=2
+)
 ```
 
-This is the **Outbox Pattern** — the intent (payout) is committed to the database before the notification (task queue) is sent. If the queue fails, the intent is still recorded and can be re-processed.
+The 2-second countdown ensures the Neon Cloud database has committed the PENDING row before the worker queries it. Without this, the worker races the DB commit and finds nothing.
 
 ---
 
 ## Phase 2: The Payout Processor (Celery Worker)
 
-### Shard-Aware Task Lookup
+### Key Design Decisions
+
+1. **`close_old_connections()`** — Called before every DB query. Neon serverless PostgreSQL aggressively drops idle connections; without this, the worker gets stale handles that silently return empty results.
+
+2. **`acks_late=True, reject_on_worker_lost=True`** — If the worker crashes mid-task, the message goes back to Redis instead of being lost.
+
+3. **UUID casting** — Celery serializes task arguments as JSON, which strips Python's `uuid.UUID` type to a plain string. The worker explicitly casts `uuid.UUID(payout_id)` before querying PostgreSQL.
+
+4. **Shard hint fast path** — When the API dispatches the task, it passes the shard name. The worker queries that shard directly. When Beat dispatches (no shard hint), the worker hunts across all shards.
+
+### Shard-Aware Task
 
 ```python
-@app.task(name='worker_app.process_payout', bind=True, max_retries=3)
-def process_payout(self, payout_id):
-    payout = None
-    active_shard = 'default'
+@app.task(name='worker_app.process_payout', bind=True, max_retries=3,
+          acks_late=True, reject_on_worker_lost=True)
+def process_payout(self, payout_id, shard_name=None):
+    payout_uuid = uuid.UUID(payout_id)
+    close_old_connections()
 
-    # Must check all shards — task was enqueued with only the payout ID,
-    # not the shard. Merchant routing info is not stored on the task.
-    for shard in ['default', 'shard_0', 'shard_1']:
-        try:
-            payout = Payout.objects.using(shard).get(id=payout_id)
-            active_shard = shard
-            break
-        except Payout.DoesNotExist:
-            continue
+    # Fast path: API told us the shard
+    if shard_name:
+        payout = Payout.objects.using(shard_name).filter(id=payout_uuid).first()
 
+    # Fallback: hunt across all shards (Beat sweeper path)
     if not payout:
-        return  # Payout deleted (shouldn't happen in production)
+        for shard in ['shard_0', 'shard_1']:
+            payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
+            if payout: break
 
-    if payout.status not in ['PENDING', 'PROCESSING']:
-        return  # Already in terminal state — idempotency guard
+    # State machine enforcement via transition_to()
+    payout.transition_to('PROCESSING', using=active_shard)
 
-    payout.attempt_count += 1
-    if payout.status == 'PENDING':
-        payout.transition_to('PROCESSING', using=active_shard)
-    else:
-        payout.save(using=active_shard, update_fields=['attempt_count', 'updated_at'])
-    ...
+    # Simulate bank transfer (mock)
+    outcome = random.random()
+    if outcome < 0.85:  # 85% success
+        payout.transition_to('COMPLETED', using=active_shard)
+        LedgerEntry.create(DEBIT_FINAL, 0)  # Audit marker
+    else:  # 15% failure
+        payout.transition_to('FAILED', using=active_shard)
+        LedgerEntry.create(DEBIT_RELEASE, +amount)  # Atomic refund
 ```
-
-### State Transitions via `transition_to()`
-
-All status changes go through `transition_to()` — not direct field assignment:
-
-```python
-# CORRECT — state machine enforced
-payout.transition_to('COMPLETED', using=active_shard)
-
-# WRONG — bypasses all guards (never use this in worker)
-payout.status = 'COMPLETED'
-payout.save()
-```
-
-`transition_to()` enforces `LEGAL_TRANSITIONS`, raises `ValueError` on illegal moves, and does a targeted `UPDATE` on only the `status` and `updated_at` fields.
 
 ### Beat Reconciliation — The Safety Net
 
 ```python
 @app.task(name='worker_app.retry_stuck_payouts')
 def retry_stuck_payouts():
-    now = timezone.now()
+    close_old_connections()
 
-    for shard in ['default', 'shard_0', 'shard_1']:
-
-        # Case 1: Orphaned PENDING (broker was down at enqueue time)
-        # Any PENDING payout older than 30s never got a worker task.
+    for shard in ['shard_0', 'shard_1']:
+        # Case 1: Orphaned PENDING (older than 30s — API task was lost)
         orphaned = Payout.objects.using(shard).filter(
-            status='PENDING',
-            created_at__lt=now - timedelta(seconds=30),
+            status='PENDING', created_at__lt=now - 30s
         )
-        for payout in orphaned:
-            process_payout.delay(str(payout.id))
+        for p in orphaned:
+            process_payout.apply_async([str(p.id), shard], countdown=1)
 
-        # Case 2: Stuck PROCESSING (simulated bank timeout)
-        # Exponential backoff: 30s, 60s, 120s between retries
+        # Case 2: Stuck PROCESSING (exponential backoff)
         stuck = Payout.objects.using(shard).filter(status='PROCESSING')
-        for payout in stuck:
-            delay_seconds = 30 * (2 ** payout.attempt_count)
-            if payout.updated_at < now - timedelta(seconds=delay_seconds):
-                if payout.attempt_count >= 3:
-                    # Max retries — atomic failure + refund
-                    with transaction.atomic(using=shard):
-                        payout.transition_to('FAILED', using=shard)
-                        LedgerEntry.objects.using(shard).create(
-                            merchant=payout.merchant,
-                            amount_paise=payout.amount_paise,
-                            entry_type='DEBIT_RELEASE',
-                            description=f'Refund — max retries exceeded'
-                        )
-                    dispatch_payout_webhook(payout)
-                else:
-                    payout.attempt_count += 1
-                    payout.save(using=shard)
-                    process_payout.delay(str(payout.id))
+        for p in stuck:
+            if p.attempt_count >= 3:
+                # Force-fail + atomic refund
+                p.transition_to('FAILED')
+                LedgerEntry.create(DEBIT_RELEASE, +amount)
+            else:
+                p.attempt_count += 1
+                process_payout.apply_async([str(p.id), shard])
 ```
 
-This task runs every 30 seconds and covers two failure modes:
-1. **Broker failure at enqueue** — payout exists in DB but no task was ever dispatched
-2. **Worker crash mid-processing** — payout is stuck in `PROCESSING` with no terminal transition
+Runs every 30 seconds. Covers:
+- **Broker failure** — payout exists in DB but no task was dispatched
+- **Worker crash** — payout stuck in PROCESSING with no terminal transition
+- **Idempotency loop** — after 5 attempts, force-fails and clears stale locks
 
 ---
 
 ## Phase 3: Webhook Delivery Engine
 
-### Architecture
-
-After every terminal payout state change (`COMPLETED` or `FAILED`), `dispatch_payout_webhook()` is called **outside** the `transaction.atomic()` block. This is deliberate:
+After every terminal state change, `dispatch_payout_webhook()` is called **outside** the `transaction.atomic()` block:
 
 ```python
 with transaction.atomic(using=active_shard):
     payout.transition_to('COMPLETED', using=active_shard)
-    LedgerEntry.objects.using(active_shard).create(...)
+    LedgerEntry.create(...)
 # ← transaction committed here
 
-dispatch_payout_webhook(payout)  # ← called AFTER commit
+dispatch_payout_webhook(payout)  # ← AFTER commit, not inside
 ```
 
-**Why outside the transaction?**
-If webhook dispatch were inside the transaction, a webhook failure (network error, endpoint down) would rollback the `COMPLETED` payout — turning a successful payment into an apparent failure. The payout state is the ground truth; webhook delivery is best-effort notification.
+**Why outside?** If webhook dispatch fails inside the transaction, the `COMPLETED` payout would roll back — turning a successful payment into an apparent failure.
 
 ### Delivery Lifecycle
 
 ```
-dispatch_payout_webhook(payout)
-    │
-    ├── Query all active WebhookEndpoints for merchant
-    │
-    └── For each endpoint:
-            │
-            ▼
-       WebhookDelivery.objects.create(status='QUEUED')
-            │
-            ▼
-       POST payload to endpoint.url
-       Headers:
-         Content-Type: application/json
-         X-Playto-Signature: sha256=<HMAC-SHA256 of body with endpoint.secret>
-       Body:
-         {
-           "event": "payout.completed",
-           "payout_id": "uuid",
-           "status": "COMPLETED",
-           "amount_paise": 5000,
-           "merchant_id": 1,
-           "timestamp": "ISO-8601"
-         }
-            │
-       ┌────┴───────┐
-       │            │
-     200 OK      Failure
-       │            │
-     SENT        RETRYING → exponential backoff (30s, 60s, 120s)
-   (terminal)    After 3 fails → FAILED (terminal)
-                 Idempotency guard: if already SENT, exit immediately
+QUEUED → PROCESSING → SENT     (success, terminal)
+                    → RETRYING  → exponential backoff (30s, 60s, 120s)
+                    → FAILED    (after 3 failures, terminal)
 ```
 
-### HMAC Signature Verification
+### HMAC Signature
 
-Merchants can verify that deliveries genuinely originate from Playto by checking the signature:
+Every delivery includes `X-Playto-Signature: sha256=<hmac>` signed with the endpoint's secret key. Merchants verify:
 
 ```python
-import hmac, hashlib
-
-def verify_signature(body: bytes, secret: str, signature_header: str) -> bool:
-    expected = hmac.new(
-        secret.encode(), body, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(f"sha256={expected}", signature_header)
+expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+assert hmac.compare_digest(f"sha256={expected}", signature_header)
 ```
 
 ---
@@ -396,41 +304,37 @@ def verify_signature(body: bytes, secret: str, signature_header: str) -> bool:
 ### Component Architecture
 
 ```
-Dashboard.jsx
-├── State
-│   ├── balance          ← available_rupees, held_rupees
-│   ├── payouts          ← list of recent payouts with status
-│   ├── ledger           ← append-only transaction history
-│   ├── webhookEndpoints ← registered URLs with active flag
-│   └── webhookDeliveries← delivery attempts with lifecycle states
-│
-├── Tabs
-│   ├── Recent Payouts   ← table with status badges (PENDING/COMPLETED/FAILED)
-│   ├── Ledger           ← full entry history with signed amounts
-│   └── Webhooks
-│       ├── Register URL form
-│       ├── Endpoint list with hover-delete (Trash2 icon)
-│       └── Delivery History table with lifecycle states + HTTP codes
-│
-└── Smart Polling
-    ├── On standard tabs: balance + payouts every 60s
-    └── On Webhooks tab: all data every 10s (to watch QUEUED→SENT)
+App.jsx
+├── Login.jsx       — JWT authentication (username=email, password)
+└── Dashboard.jsx   — Protected route
+    ├── Balance Card     — available_rupees, held_rupees
+    ├── Payout Form      — amount + bank account + Idempotency-Key per submit
+    ├── Tabs
+    │   ├── Recent Payouts  — status badges (PENDING/PROCESSING/COMPLETED/FAILED)
+    │   ├── Ledger          — full entry history with signed amounts
+    │   └── Webhooks
+    │       ├── Register URL form
+    │       ├── Endpoint list with delete
+    │       └── Delivery history with lifecycle states + HTTP codes
+    └── Smart Polling
+        ├── Standard tabs: balance + payouts every 60s
+        └── Webhooks tab: all data every 10s
 ```
 
-### Idempotency on the Client
+### Client-Side Idempotency
 
-Every payout form submission generates a fresh UUID v4:
+Every payout submission generates a fresh UUID v4:
 
 ```javascript
 await api.post('/api/v1/payouts/', {
   amount_paise: Math.round(parseFloat(amount) * 100),
   bank_account_id: bankAccount,
 }, {
-  headers: { 'Idempotency-Key': uuidv4() }
+  headers: { 'Idempotency-Key': crypto.randomUUID() }
 });
 ```
 
-If the user double-clicks "Submit" or the request is retried on a slow connection, the server's two-tier idempotency system ensures exactly one payout is created.
+Double-clicks or network retries are safely deduplicated by the server's two-tier idempotency system.
 
 ---
 
@@ -438,163 +342,68 @@ If the user double-clicks "Submit" or the request is retried on a slow connectio
 
 ### Strategy
 
-Tests run using Django's `TransactionTestCase` with `databases = '__all__'` — all four DB aliases are created and cleaned per test. Three mocks are applied:
+Tests use `TransactionTestCase` with `databases = '__all__'`. Three mocks ensure tests run without external services:
 
 | Mock | Reason |
 |---|---|
-| `payouts.views._idem_redis` | In-memory dict with correct `SET NX` semantics — no Redis server needed |
-| `payouts.views.process_payout.delay` | No Celery broker needed — task is not the subject under test |
-| `config.routers.ShardRouter.get_shard` → `'default'` | All ORM calls land on the single test DB — no multi-DB complexity |
+| `_idem_redis` | In-memory dict with correct `SET NX` semantics |
+| `process_payout.delay` | No Celery broker needed |
+| `ShardRouter.get_shard` → `'default'` | All ORM calls land on single test DB |
 
-### Test Coverage
-
-```bash
-cd backend
-python manage.py test payouts.tests --verbosity=2
-# Ran 3 tests in 0.990s — OK ✅
-```
+### Tests
 
 | Test | File | What It Proves |
 |---|---|---|
-| `test_same_key_returns_same_response` | `test_idempotency.py` | Same UUID returns identical payout ID. Zero duplicate rows in DB. Redis mock correctly replays the cached response on the second call. |
-| `test_different_key_creates_new_payout` | `test_idempotency.py` | Two different UUIDs create two independent payouts. No cross-key contamination. |
-| `test_simultaneous_payouts` | `test_concurrency.py` | Two sequential 60₹ requests against a 100₹ balance. `SELECT FOR UPDATE` ensures exactly one 201 and one 402. Exactly one Payout row in DB — zero double-spend. |
+| `test_same_key_returns_same_response` | `test_idempotency.py` | Same UUID returns identical payout ID. Zero duplicate rows. |
+| `test_different_key_creates_new_payout` | `test_idempotency.py` | Different keys create independent payouts. |
+| `test_simultaneous_payouts` | `test_concurrency.py` | `SELECT FOR UPDATE` prevents double-spend — exactly one 201, one 402. |
 
-### Redis Mock Implementation
+### CI/CD
 
-```python
-def make_redis_mock():
-    """In-memory fake Redis with correct SET NX semantics."""
-    store = {}
-    mock = MagicMock()
-
-    def fake_set(key, value, ex=None, nx=False):
-        if nx:
-            if key in store:
-                return False   # SET NX fails — key exists
-            store[key] = value
-            return True        # SET NX succeeds — key claimed
-        store[key] = value
-        return True
-
-    def fake_get(key):
-        return store.get(key)
-
-    def fake_delete(key):
-        store.pop(key, None)
-
-    mock.get.side_effect = fake_get
-    mock.set.side_effect = fake_set
-    mock.delete.side_effect = fake_delete
-    return mock
-```
-
-The `nx=True` branch is critical — without it the mock would allow both concurrent requests to claim the key, making the concurrency test meaningless.
+Tests run automatically on every push via GitHub Actions against real PostgreSQL 15 and Redis 7 services — no SQLite mocks.
 
 ---
 
-## Security Considerations
+## Security
 
 | Control | Implementation |
 |---|---|
-| **Authentication** | JWT via `djangorestframework-simplejwt`. All endpoints require `IsAuthenticated`. |
-| **Rate Limiting** | DRF `UserRateThrottle` — 300 req/min authenticated, 20 req/min anonymous. Prevents brute force and accidental polling storms. |
-| **Idempotency Key Scoping** | Keys are namespaced `idem:<merchant_id>:<key>` — one merchant's keys never collide with another's. |
-| **Cross-DB Isolation** | `idempotency_db` alias is a separate PostgreSQL connection. Business data migrations never touch it; idempotency migrations never touch business tables. |
-| **Webhook HMAC** | `X-Playto-Signature: sha256=<digest>` signed with per-endpoint secret. Merchants can verify authenticity of every delivery. |
-| **Non-root Containers** | Docker containers run as `django`/`celery` users — not root. |
-| **DEBIT_HOLD before processing** | Funds are reserved at request time, not at processing time. Worker can never debit funds that weren't already locked by the API. |
+| **Authentication** | JWT (1-hour access, 7-day refresh). All endpoints require `IsAuthenticated`. |
+| **Rate Limiting** | DRF `UserRateThrottle` — 300/min authenticated, 20/min anonymous |
+| **Key Scoping** | Idempotency keys namespaced `idem:<merchant_id>:<key>` — no cross-merchant collision |
+| **DB Isolation** | `idempotency_db` is a separate PostgreSQL instance — independent migrations and lifecycle |
+| **Webhook HMAC** | `X-Playto-Signature: sha256=<digest>` per-endpoint secret |
+| **Non-root Containers** | Docker runs as `celery`/`django` users, never root |
+| **DEBIT_HOLD first** | Funds reserved at request time — worker can never debit unreserved funds |
 
 ---
 
-## Running the Full System
+## Production Operations
 
-### Terminal 1 — Django API
-```bash
-cd /path/to/Payto-pay/backend
-source ../.venv/bin/activate
-python manage.py runserver
-# → http://localhost:8000
-```
-
-### Terminal 2 — Celery Worker + Beat Scheduler
-```bash
-cd /path/to/Payto-pay
-source .venv/bin/activate
-export PYTHONPATH=./backend
-export DJANGO_SETTINGS_MODULE=config.settings
-celery -A worker.worker_app worker -l info -B
-```
-
-### Terminal 3 — React Frontend
-```bash
-cd /path/to/Payto-pay/frontend
-npm install && npm run dev
-# → http://localhost:5173
-```
-
-### First-Time Database Setup (Local Manual Run)
-
-If running the services manually (outside of Docker):
-```bash
-cd backend
-python manage.py migrate --database=default
-python manage.py migrate --database=shard_0
-python manage.py migrate --database=shard_1
-python manage.py migrate --database=idempotency_db
-python manage.py seed  # Creates 3 demo merchants with seeded balance
-```
-
-**Note for Docker Users:**
-The `docker-compose up` command automatically triggers `docker-entrypoint.sh`, which performs all the above migrations and seeding for you. You do not need to run these manually if using Docker.
-
----
-
-## Production Deployment
-
-### Infrastructure
-
-| Component | Platform | URL |
-|---|---|---|
-| Frontend | Vercel | `https://playto-engine-vert.vercel.app` |
-| Backend API | AWS EC2 + Docker | `https://playtopay.duckdns.org` |
-| TLS Termination | Nginx on EC2 | Reverse proxy to Django `:8000` |
-| Domain | DuckDNS | Dynamic DNS pointing to EC2 public IP |
-
-### Key Configuration
-
-**Django (`settings.py`):**
-```python
-# Trust the X-Forwarded-Proto header from Nginx
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-```
-
-**Environment (`.env` on EC2):**
-```env
-ALLOWED_HOSTS=localhost,127.0.0.1,backend,13.206.122.212,playtopay.duckdns.org
-CORS_ALLOWED_ORIGINS=https://playto-engine-vert.vercel.app,https://playtopay.duckdns.org,http://localhost:5173
-```
-
-**Frontend SPA Routing (`frontend/vercel.json`):**
-```json
-{
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
-  ]
-}
-```
-This tells Vercel to serve `index.html` for all routes, allowing React Router to handle client-side navigation (fixes 404 on page refresh).
-
-### Deploy Workflow
+### Clearing Stuck Payouts
 
 ```bash
-# On local machine
-git add . && git commit -m "fix: description" && git push origin main
+docker compose exec backend python manage.py shell --command="
+from payouts.models import Payout
+for shard in ['shard_0', 'shard_1']:
+    count = Payout.objects.using(shard).filter(
+        status__in=['PENDING', 'PROCESSING']
+    ).update(status='FAILED')
+    print(f'Cleared {count} payouts in {shard}')
+"
+```
 
-# On EC2
-git pull origin main
+### Full Reset
+
+```bash
+docker compose down -v     # -v removes database volumes
 docker compose up -d --build
 ```
 
-Vercel auto-deploys on push to `main`. Backend requires manual pull + rebuild on EC2.
+### Deploy
 
+```bash
+git push origin main  # CI/CD: test → build → push → deploy to EC2
+```
+
+Vercel auto-deploys frontend on push. Backend deploys via GitHub Actions SSH to EC2.
