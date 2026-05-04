@@ -1,27 +1,37 @@
+"""
+Playto Payout Engine — Celery Worker
+=====================================
+Processes payouts across sharded PostgreSQL databases (Neon Cloud).
+
+Architecture:
+  - API dispatches: process_payout.apply_async([payout_id, shard_name], countdown=2)
+  - Beat sweeper:   every 30s, finds orphaned/stuck payouts and re-queues them
+  - Idempotency:    Redis L1 + PostgreSQL L2 prevents double-processing
+  - State Machine:  PENDING → PROCESSING → COMPLETED/FAILED (enforced by model)
+"""
+
 import os
+import sys
 import random
 import uuid
 import redis
-import json
 from celery import Celery
 
-# Setup Django before importing models
+# ── Django Setup (must happen before model imports) ───────────────────────────
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 import django
 django.setup()
 
-from django.db import transaction
+from django.db import transaction, close_old_connections
 from django.conf import settings
 from payouts.models import Payout
 from merchants.models import LedgerEntry
 from webhooks.tasks import dispatch_payout_webhook
 
+# ── Celery App ────────────────────────────────────────────────────────────────
 app = Celery('worker_app', broker=os.environ.get('REDIS_URL', 'redis://localhost:6379/0'))
 
-import logging
-logger = logging.getLogger('payouts')
-
-# ── Redis connection for idempotency key cleanup ──────────────────────────────
+# ── Redis for idempotency L1 cache ───────────────────────────────────────────
 _idem_redis = redis.Redis.from_url(
     settings.IDEMPOTENCY_REDIS_URL,
     decode_responses=True,
@@ -30,200 +40,268 @@ _idem_redis = redis.Redis.from_url(
 # Database alias for idempotency keys
 IDEM_DB = getattr(settings, 'IDEMPOTENCY_DB_ALIAS', 'idempotency_db')
 
-# Maximum attempts before force-failing a payout stuck in an idempotency loop
-MAX_LOOP_ATTEMPTS = 5
+# Max retry attempts before force-failing a stuck payout
+MAX_ATTEMPTS = 5
+
+# All data shards (no 'default' — it mirrors shard_0 and causes confusion)
+SHARDS = ['shard_0', 'shard_1']
 
 
+def log(msg):
+    """Print to stdout with flush — the ONLY reliable way to see output in Docker logs."""
+    print(f"[WORKER] {msg}", flush=True)
+
+
+# ── Helper: find payout across shards ─────────────────────────────────────────
+def _find_payout(payout_uuid, hint_shard=None):
+    """
+    Locate a payout across shards.
+    
+    Args:
+        payout_uuid: UUID object for the payout
+        hint_shard: Optional shard name (fast path from API dispatch)
+        
+    Returns:
+        (payout, shard_name) or (None, None)
+    """
+    # Close stale DB connections before querying (critical for long-lived workers)
+    close_old_connections()
+    
+    # Fast path: API told us exactly which shard
+    if hint_shard:
+        try:
+            payout = Payout.objects.using(hint_shard).filter(id=payout_uuid).first()
+            if payout:
+                log(f"🎯 Found {payout_uuid} in specified shard: {hint_shard}")
+                return payout, hint_shard
+            else:
+                log(f"⚠️ Not found in specified shard {hint_shard}, falling back to hunt")
+        except Exception as e:
+            log(f"⚠️ Error querying specified shard {hint_shard}: {e}")
+
+    # Fallback: scan all shards
+    for shard in SHARDS:
+        try:
+            payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
+            if payout:
+                log(f"🎯 Found {payout_uuid} in shard: {shard}")
+                return payout, shard
+        except Exception as e:
+            log(f"⚠️ Could not query {shard}: {e}")
+            continue
+
+    return None, None
+
+
+# ── Helper: clear stale idempotency locks ────────────────────────────────────
 def _clear_idempotency_lock(payout):
-    """
-    Clear stale idempotency locks for a payout that is being force-failed.
-    This prevents the infinite loop where:
-      1. Beat finds PENDING payout → queues task
-      2. Worker sees idempotency lock → exits in 0.0001s
-      3. Payout stays PENDING forever
-    """
+    """Remove stale IN_FLIGHT idempotency keys from both Redis and PostgreSQL."""
     from payouts.models import IdempotencyKey
 
     try:
-        # Find and remove any IN_FLIGHT idempotency keys for this merchant
         stale_keys = IdempotencyKey.objects.using(IDEM_DB).filter(
             merchant_id=payout.merchant_id,
             idem_status=IdempotencyKey.STATUS_IN_FLIGHT,
         )
         count = stale_keys.count()
         if count > 0:
-            # Also clear from Redis L1
             for key_record in stale_keys:
                 rkey = f'idem:{payout.merchant_id}:{key_record.key}'
                 _idem_redis.delete(rkey)
-                logger.info(f"🧹 [WORKER] Cleared Redis idem lock: {rkey}")
-
+                log(f"🧹 Cleared Redis idem lock: {rkey}")
             stale_keys.delete()
-            logger.info(f"🧹 [WORKER] Cleared {count} stale idempotency key(s) from PostgreSQL")
+            log(f"🧹 Cleared {count} stale idempotency key(s) from PostgreSQL")
     except Exception as e:
-        logger.warning(f"⚠️ [WORKER] Could not clear idempotency locks: {e}")
+        log(f"⚠️ Could not clear idempotency locks: {e}")
 
 
-@app.task(name='worker_app.process_payout', bind=True, max_retries=3)
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN TASK: Process a single payout
+# ══════════════════════════════════════════════════════════════════════════════
+@app.task(name='worker_app.process_payout', bind=True, max_retries=3,
+          acks_late=True, reject_on_worker_lost=True)
 def process_payout(self, payout_id, shard_name=None):
-    print(f"[WORKER] >>> process_payout called with payout_id={payout_id}, shard_name={shard_name}", flush=True)
+    """
+    Process a payout end-to-end.
     
-    # Convert string ID back to UUID object — Celery JSON serialization
-    # strips the UUID type, causing Postgres queries to silently fail
+    Called by:
+      - API dispatch: process_payout.apply_async([id, shard], countdown=2)
+      - Beat sweeper: process_payout.delay(id)  (no shard hint)
+      
+    State machine: PENDING → PROCESSING → COMPLETED/FAILED
+    """
+    log(f">>> process_payout(id={payout_id}, shard={shard_name})")
+
+    # ── Step 1: Convert string to UUID ────────────────────────────────────
     try:
         payout_uuid = uuid.UUID(payout_id) if isinstance(payout_id, str) else payout_id
-    except ValueError:
-        print(f"[WORKER] ❌ Invalid Payout ID format: {payout_id}", flush=True)
+    except (ValueError, AttributeError) as e:
+        log(f"❌ Invalid payout ID: {payout_id} ({e})")
         return
 
-    payout = None
-    active_shard = 'shard_0'
-    
-    # Fast path: if the API told us which shard, use it directly
-    if shard_name:
-        try:
-            payout = Payout.objects.using(shard_name).filter(id=payout_uuid).first()
-            if payout:
-                active_shard = shard_name
-                print(f"[WORKER] 🎯 Found payout {payout_uuid} in specified shard: {shard_name}", flush=True)
-        except Exception as e:
-            print(f"[WORKER] ⚠️ Could not query specified shard {shard_name}: {e}", flush=True)
+    short_id = str(payout_uuid)[:8]
 
-    # Fallback: hunt across all shards (used by Beat sweeper)
-    if not payout:
-        print(f"[WORKER] 🔍 Hunting for payout {payout_uuid} across shards...", flush=True)
-        for shard in ['shard_0', 'shard_1']:
-            try:
-                payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
-                if payout:
-                    active_shard = shard
-                    print(f"[WORKER] 🎯 Found payout {payout_uuid} in shard: {shard}", flush=True)
-                    break
-                else:
-                    print(f"[WORKER] ⏭️ Not in {shard}", flush=True)
-            except Exception as e:
-                print(f"[WORKER] ⚠️ Could not query {shard}: {e}", flush=True)
-                continue
+    # ── Step 2: Find the payout in the sharded databases ──────────────────
+    payout, active_shard = _find_payout(payout_uuid, hint_shard=shard_name)
 
     if not payout:
-        print(f"[WORKER] ❌ Payout {payout_id} NOT FOUND in any shard!", flush=True)
+        log(f"❌ Payout {short_id} NOT FOUND in any shard!")
         return
 
-    # Skip if already in a terminal state
-    if payout.status not in ['PENDING', 'PROCESSING']:
-        logger.info(f"⏭️ [WORKER] Payout {str(payout_id)[:8]} already in terminal state: {payout.status}")
+    log(f"📋 Payout {short_id}: status={payout.status}, attempts={payout.attempt_count}, shard={active_shard}")
+
+    # ── Step 3: Skip terminal states ──────────────────────────────────────
+    if payout.status not in ('PENDING', 'PROCESSING'):
+        log(f"⏭️ Payout {short_id} already terminal: {payout.status}")
         return
 
+    # ── Step 4: Increment attempt counter ─────────────────────────────────
     payout.attempt_count += 1
-    short_id = str(payout_id)[:8]
 
-    # ── Idempotency Loop Breaker ──────────────────────────────────────────────
-    # If a payout has been retried too many times without ever advancing past
-    # PENDING, it is stuck in an idempotency loop. Force-fail it and release
-    # the held funds so the dashboard reflects reality.
-    if payout.attempt_count >= MAX_LOOP_ATTEMPTS and payout.status == 'PENDING':
-        logger.warning(
-            f"🔓 [WORKER] Payout {short_id} stuck in PENDING after {payout.attempt_count} attempts. "
-            f"Breaking idempotency loop — force-failing and releasing funds."
-        )
+    # ── Step 5: Idempotency loop breaker ──────────────────────────────────
+    # After MAX_ATTEMPTS, force-fail and refund to prevent infinite loops
+    if payout.attempt_count >= MAX_ATTEMPTS and payout.status == 'PENDING':
+        log(f"🔓 Payout {short_id} stuck after {payout.attempt_count} attempts — force-failing")
         _clear_idempotency_lock(payout)
-        with transaction.atomic(using=active_shard):
-            payout.transition_to('PROCESSING', using=active_shard)
-            payout.transition_to('FAILED', using=active_shard)
-            LedgerEntry.objects.using(active_shard).create(
-                merchant=payout.merchant,
-                amount_paise=payout.amount_paise,
-                entry_type='DEBIT_RELEASE',
-                description=f'Refund — idempotency loop breaker for payout {payout.id}'
-            )
-        dispatch_payout_webhook(payout)
+        try:
+            with transaction.atomic(using=active_shard):
+                payout.transition_to('PROCESSING', using=active_shard)
+                payout.transition_to('FAILED', using=active_shard)
+                LedgerEntry.objects.using(active_shard).create(
+                    merchant=payout.merchant,
+                    amount_paise=payout.amount_paise,
+                    entry_type='DEBIT_RELEASE',
+                    description=f'Refund — loop breaker for payout {payout.id}'
+                )
+            log(f"💸 Payout {short_id} force-FAILED, funds released")
+            dispatch_payout_webhook(payout)
+        except Exception as e:
+            log(f"❌ Failed to force-fail payout {short_id}: {e}")
         return
 
+    # ── Step 6: Transition to PROCESSING ──────────────────────────────────
     if payout.status == 'PENDING':
-        logger.info(f"📥 [WORKER] Starting new payout {short_id}... (Shard: {active_shard})")
-        payout.transition_to('PROCESSING', using=active_shard)
+        try:
+            payout.transition_to('PROCESSING', using=active_shard)
+            log(f"📥 Payout {short_id} → PROCESSING (shard: {active_shard})")
+        except ValueError as e:
+            log(f"⚠️ Cannot transition {short_id}: {e}")
+            return
     else:
-        logger.info(f"🔄 [WORKER] Retrying payout {short_id} (Attempt {payout.attempt_count})...")
+        # Already PROCESSING — just update attempt count
         payout.save(using=active_shard, update_fields=['attempt_count', 'updated_at'])
+        log(f"🔄 Retrying payout {short_id} (attempt {payout.attempt_count})")
 
+    # ── Step 7: Simulate bank transfer (mock) ─────────────────────────────
+    # In production, this would call a real payment gateway API
     outcome = random.random()
 
     if outcome < 0.1:
-        logger.info(f"⏳ [WORKER] Payout {short_id} HUNG. Scheduling retry in 30s.")
-        process_payout.apply_async((payout_id,), countdown=30)
+        # 10% chance: bank timeout → retry later
+        log(f"⏳ Payout {short_id} — bank timeout. Retrying in 30s.")
+        process_payout.apply_async(
+            args=[str(payout_uuid), active_shard], countdown=30
+        )
         return
 
-    elif outcome < 0.8:
-        logger.info(f"✅ [WORKER] Payout {short_id} SUCCESS!")
-        with transaction.atomic(using=active_shard):
-            payout.transition_to('COMPLETED', using=active_shard)
-            LedgerEntry.objects.using(active_shard).create(
-                merchant=payout.merchant,
-                amount_paise=0,
-                entry_type='DEBIT_FINAL',
-                description=f'Finalized payout {payout.id}'
-            )
-        dispatch_payout_webhook(payout)
+    elif outcome < 0.85:
+        # 75% chance: success
+        try:
+            with transaction.atomic(using=active_shard):
+                payout.transition_to('COMPLETED', using=active_shard)
+                LedgerEntry.objects.using(active_shard).create(
+                    merchant=payout.merchant,
+                    amount_paise=0,
+                    entry_type='DEBIT_FINAL',
+                    description=f'Finalized payout {payout.id}'
+                )
+            log(f"✅ Payout {short_id} COMPLETED!")
+            dispatch_payout_webhook(payout)
+        except Exception as e:
+            log(f"❌ Error completing payout {short_id}: {e}")
 
     else:
-        logger.info(f"❌ [WORKER] Payout {short_id} FAILED. Reversing funds.")
-        with transaction.atomic(using=active_shard):
-            payout.transition_to('FAILED', using=active_shard)
-            LedgerEntry.objects.using(active_shard).create(
-                merchant=payout.merchant,
-                amount_paise=payout.amount_paise,
-                entry_type='DEBIT_RELEASE',
-                description=f'Refund for failed payout {payout.id}'
-            )
-        dispatch_payout_webhook(payout)
+        # 15% chance: bank rejection → fail and refund
+        try:
+            with transaction.atomic(using=active_shard):
+                payout.transition_to('FAILED', using=active_shard)
+                LedgerEntry.objects.using(active_shard).create(
+                    merchant=payout.merchant,
+                    amount_paise=payout.amount_paise,
+                    entry_type='DEBIT_RELEASE',
+                    description=f'Refund for failed payout {payout.id}'
+                )
+            log(f"❌ Payout {short_id} FAILED — funds refunded")
+            dispatch_payout_webhook(payout)
+        except Exception as e:
+            log(f"❌ Error failing payout {short_id}: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BEAT TASK: Sweep for orphaned/stuck payouts every 30 seconds
+# ══════════════════════════════════════════════════════════════════════════════
 @app.task(name='worker_app.retry_stuck_payouts')
 def retry_stuck_payouts():
     """
-    Beat task running every 30 seconds. Checks all shards for:
-    1. PENDING payouts that never got a task (orphaned).
-    2. PROCESSING payouts that are hanging (backoff/retry).
+    Periodic sweep that catches payouts the real-time path missed.
+    
+    Handles two cases:
+      1. PENDING > 30s old: API task was lost, re-dispatch with shard hint
+      2. PROCESSING too long: Exponential backoff, force-fail after max retries
     """
     from django.utils import timezone
     from datetime import timedelta
 
+    close_old_connections()
     now = timezone.now()
-    # Shards we need to check (including default just in case)
-    shards = ['shard_0', 'shard_1']
 
-    for shard in shards:
-        # ── Case 1: Orphaned PENDING payouts ──
-        orphaned = Payout.objects.using(shard).filter(
-            status='PENDING',
-            created_at__lt=now - timedelta(seconds=30),
-        )
-        for payout in orphaned:
-            logger.info(f"🔁 [BEAT] Re-queuing orphaned PENDING payout {str(payout.id)[:8]} (attempt {payout.attempt_count}, shard: {shard})")
-            process_payout.delay(str(payout.id))
+    for shard in SHARDS:
+        try:
+            # ── Case 1: Orphaned PENDING payouts (older than 30s) ─────────
+            orphaned = list(Payout.objects.using(shard).filter(
+                status='PENDING',
+                created_at__lt=now - timedelta(seconds=30),
+            ))
+            for payout in orphaned:
+                log(f"🔁 [BEAT] Re-queuing orphaned PENDING {str(payout.id)[:8]} "
+                    f"(attempt {payout.attempt_count}, shard: {shard})")
+                # Pass shard hint so the worker doesn't have to hunt
+                process_payout.apply_async(
+                    args=[str(payout.id), shard], countdown=1
+                )
 
-        # ── Case 2: Stuck PROCESSING payouts ──
-        stuck = Payout.objects.using(shard).filter(status='PROCESSING')
-        for payout in stuck:
-            delay_seconds = 30 * (2 ** payout.attempt_count)
-            if payout.updated_at < now - timedelta(seconds=delay_seconds):
-                if payout.attempt_count >= 3:
-                    logger.warning(f"💀 [BEAT] Payout {str(payout.id)[:8]} exceeded max retries — force-failing.")
-                    with transaction.atomic(using=shard):
-                        payout.transition_to('FAILED', using=shard)
-                        LedgerEntry.objects.using(shard).create(
-                            merchant=payout.merchant,
-                            amount_paise=payout.amount_paise,
-                            entry_type='DEBIT_RELEASE',
-                            description=f'Refund for max-retries payout {payout.id}'
+            # ── Case 2: Stuck PROCESSING payouts ──────────────────────────
+            stuck = list(Payout.objects.using(shard).filter(status='PROCESSING'))
+            for payout in stuck:
+                delay_seconds = 30 * (2 ** payout.attempt_count)
+                if payout.updated_at < now - timedelta(seconds=delay_seconds):
+                    if payout.attempt_count >= 3:
+                        log(f"💀 [BEAT] Payout {str(payout.id)[:8]} exceeded max retries — force-failing")
+                        try:
+                            with transaction.atomic(using=shard):
+                                payout.transition_to('FAILED', using=shard)
+                                LedgerEntry.objects.using(shard).create(
+                                    merchant=payout.merchant,
+                                    amount_paise=payout.amount_paise,
+                                    entry_type='DEBIT_RELEASE',
+                                    description=f'Refund for max-retries payout {payout.id}'
+                                )
+                            dispatch_payout_webhook(payout)
+                        except Exception as e:
+                            log(f"❌ [BEAT] Failed to force-fail {str(payout.id)[:8]}: {e}")
+                    else:
+                        payout.attempt_count += 1
+                        payout.save(using=shard, update_fields=['attempt_count', 'updated_at'])
+                        process_payout.apply_async(
+                            args=[str(payout.id), shard], countdown=2
                         )
-                    dispatch_payout_webhook(payout)
-                else:
-                    payout.attempt_count += 1
-                    payout.save(using=shard)
-                    process_payout.delay(str(payout.id))
+                        log(f"🔄 [BEAT] Retrying PROCESSING {str(payout.id)[:8]} "
+                            f"(attempt {payout.attempt_count})")
+        except Exception as e:
+            log(f"⚠️ [BEAT] Error scanning shard {shard}: {e}")
 
 
+# ── Beat Schedule ─────────────────────────────────────────────────────────────
 app.conf.beat_schedule = {
     'retry-stuck-payouts-every-30-seconds': {
         'task': 'worker_app.retry_stuck_payouts',
