@@ -66,12 +66,14 @@ def _clear_idempotency_lock(payout):
 
 @app.task(name='worker_app.process_payout', bind=True, max_retries=3)
 def process_payout(self, payout_id, shard_name=None):
+    print(f"[WORKER] >>> process_payout called with payout_id={payout_id}, shard_name={shard_name}", flush=True)
+    
     # Convert string ID back to UUID object — Celery JSON serialization
     # strips the UUID type, causing Postgres queries to silently fail
     try:
         payout_uuid = uuid.UUID(payout_id) if isinstance(payout_id, str) else payout_id
     except ValueError:
-        logger.error(f"❌ [WORKER] Invalid Payout ID format: {payout_id}")
+        print(f"[WORKER] ❌ Invalid Payout ID format: {payout_id}", flush=True)
         return
 
     payout = None
@@ -83,26 +85,28 @@ def process_payout(self, payout_id, shard_name=None):
             payout = Payout.objects.using(shard_name).filter(id=payout_uuid).first()
             if payout:
                 active_shard = shard_name
-                logger.info(f"🎯 [WORKER] Found payout {payout_uuid} in specified shard: {shard_name}")
+                print(f"[WORKER] 🎯 Found payout {payout_uuid} in specified shard: {shard_name}", flush=True)
         except Exception as e:
-            logger.warning(f"⚠️ [WORKER] Could not query specified shard {shard_name}: {e}")
+            print(f"[WORKER] ⚠️ Could not query specified shard {shard_name}: {e}", flush=True)
 
     # Fallback: hunt across all shards (used by Beat sweeper)
     if not payout:
-        logger.info(f"🔍 [WORKER] Hunting for payout {payout_uuid} across all shards...")
+        print(f"[WORKER] 🔍 Hunting for payout {payout_uuid} across shards...", flush=True)
         for shard in ['shard_0', 'shard_1']:
             try:
                 payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
                 if payout:
                     active_shard = shard
-                    logger.info(f"🎯 [WORKER] Found payout {payout_uuid} in shard: {shard}")
+                    print(f"[WORKER] 🎯 Found payout {payout_uuid} in shard: {shard}", flush=True)
                     break
+                else:
+                    print(f"[WORKER] ⏭️ Not in {shard}", flush=True)
             except Exception as e:
-                logger.warning(f"⚠️ [WORKER] Could not query {shard}: {e}")
+                print(f"[WORKER] ⚠️ Could not query {shard}: {e}", flush=True)
                 continue
 
     if not payout:
-        logger.error(f"❌ [WORKER] Payout {payout_id} NOT FOUND in any shard! Check DB connections.")
+        print(f"[WORKER] ❌ Payout {payout_id} NOT FOUND in any shard!", flush=True)
         return
 
     # Skip if already in a terminal state
