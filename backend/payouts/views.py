@@ -190,7 +190,7 @@ class PayoutCreateView(APIView):
                 # The 2s countdown gives the DB plenty of time to flush.
                 try:
                     process_payout.apply_async(
-                        args=[str(payout.id)], countdown=2
+                        args=[str(payout.id), active_shard], countdown=2
                     )
                 except Exception:
                     pass  # Non-fatal — Beat will pick it up within 30s

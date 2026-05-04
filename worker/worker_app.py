@@ -65,7 +65,7 @@ def _clear_idempotency_lock(payout):
 
 
 @app.task(name='worker_app.process_payout', bind=True, max_retries=3)
-def process_payout(self, payout_id):
+def process_payout(self, payout_id, shard_name=None):
     # Convert string ID back to UUID object — Celery JSON serialization
     # strips the UUID type, causing Postgres queries to silently fail
     try:
@@ -77,19 +77,29 @@ def process_payout(self, payout_id):
     payout = None
     active_shard = 'shard_0'
     
-    # Iterate shards to find this specific payout
-    logger.info(f"🔍 [WORKER] Searching for payout {payout_uuid} across all shards...")
-    
-    for shard in ['shard_0', 'shard_1']:
+    # Fast path: if the API told us which shard, use it directly
+    if shard_name:
         try:
-            payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
+            payout = Payout.objects.using(shard_name).filter(id=payout_uuid).first()
             if payout:
-                active_shard = shard
-                logger.info(f"🎯 [WORKER] Found payout {payout_id} in shard: {shard}")
-                break
+                active_shard = shard_name
+                logger.info(f"🎯 [WORKER] Found payout {payout_uuid} in specified shard: {shard_name}")
         except Exception as e:
-            logger.warning(f"⚠️ [WORKER] Could not query {shard}: {e}")
-            continue
+            logger.warning(f"⚠️ [WORKER] Could not query specified shard {shard_name}: {e}")
+
+    # Fallback: hunt across all shards (used by Beat sweeper)
+    if not payout:
+        logger.info(f"🔍 [WORKER] Hunting for payout {payout_uuid} across all shards...")
+        for shard in ['shard_0', 'shard_1']:
+            try:
+                payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
+                if payout:
+                    active_shard = shard
+                    logger.info(f"🎯 [WORKER] Found payout {payout_uuid} in shard: {shard}")
+                    break
+            except Exception as e:
+                logger.warning(f"⚠️ [WORKER] Could not query {shard}: {e}")
+                continue
 
     if not payout:
         logger.error(f"❌ [WORKER] Payout {payout_id} NOT FOUND in any shard! Check DB connections.")
