@@ -1,5 +1,6 @@
 import os
 import random
+import uuid
 import redis
 import json
 from celery import Celery
@@ -65,15 +66,23 @@ def _clear_idempotency_lock(payout):
 
 @app.task(name='worker_app.process_payout', bind=True, max_retries=3)
 def process_payout(self, payout_id):
+    # Convert string ID back to UUID object — Celery JSON serialization
+    # strips the UUID type, causing Postgres queries to silently fail
+    try:
+        payout_uuid = uuid.UUID(payout_id) if isinstance(payout_id, str) else payout_id
+    except ValueError:
+        logger.error(f"❌ [WORKER] Invalid Payout ID format: {payout_id}")
+        return
+
     payout = None
-    active_shard = 'default'
+    active_shard = 'shard_0'
     
     # Iterate shards to find this specific payout
-    logger.info(f"🔍 [WORKER] Searching for payout {payout_id} across all shards...")
+    logger.info(f"🔍 [WORKER] Searching for payout {payout_uuid} across all shards...")
     
     for shard in ['shard_0', 'shard_1']:
         try:
-            payout = Payout.objects.using(shard).filter(id=payout_id).first()
+            payout = Payout.objects.using(shard).filter(id=payout_uuid).first()
             if payout:
                 active_shard = shard
                 logger.info(f"🎯 [WORKER] Found payout {payout_id} in shard: {shard}")
