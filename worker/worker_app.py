@@ -71,13 +71,15 @@ def process_payout(self, payout_id):
     # Iterate shards to find this specific payout
     logger.info(f"🔍 [WORKER] Searching for payout {payout_id} across all shards...")
     
-    for shard in ['default', 'shard_0', 'shard_1']:
+    for shard in ['shard_0', 'shard_1']:
         try:
-            payout = Payout.objects.using(shard).get(id=payout_id)
-            active_shard = shard
-            logger.info(f"🎯 [WORKER] Found payout {payout_id} in shard: {shard}")
-            break
-        except Payout.DoesNotExist:
+            payout = Payout.objects.using(shard).filter(id=payout_id).first()
+            if payout:
+                active_shard = shard
+                logger.info(f"🎯 [WORKER] Found payout {payout_id} in shard: {shard}")
+                break
+        except Exception as e:
+            logger.warning(f"⚠️ [WORKER] Could not query {shard}: {e}")
             continue
 
     if not payout:
@@ -165,7 +167,7 @@ def retry_stuck_payouts():
 
     now = timezone.now()
     # Shards we need to check (including default just in case)
-    shards = ['default', 'shard_0', 'shard_1']
+    shards = ['shard_0', 'shard_1']
 
     for shard in shards:
         # ── Case 1: Orphaned PENDING payouts ──
